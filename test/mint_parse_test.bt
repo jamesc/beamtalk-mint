@@ -47,9 +47,9 @@ TestCase subclass: MintParseTest
     self assert: parts size equals: 4
     self assert: (parts at: 1) equals: {#status, 0, 200}
     self assert: ((parts at: 3) at: 1) equals: #data
-    self assert: (((parts at: 3) at: 3) asString) equals: "Wikipedia"
+    self assert: (MintHTTP1 stringOrOpaque: ((parts at: 3) at: 3)) equals: "Wikipedia"
     self assert: (parts at: 4) equals: {#done, 0}
-    self assert: (done buffer asString) equals: "TAIL"
+    self assert: (MintHTTP1 stringOrOpaque: (done buffer)) equals: "TAIL"
 
   testChunkedCaseInsensitiveHex =>
     raw := "HTTP/1.1 200 OK"
@@ -68,7 +68,7 @@ TestCase subclass: MintParseTest
       stream: raw
       method: "GET"
       ref: 1) unwrap
-    self assert: (((parts at: 3) at: 3) asString) equals: "0123456789"
+    self assert: (MintHTTP1 stringOrOpaque: ((parts at: 3) at: 3)) equals: "0123456789"
 
   testKeepAlivePipelinedResponses =>
     raw := "HTTP/1.1 200 OK"
@@ -86,9 +86,9 @@ TestCase subclass: MintParseTest
       stream: raw
       method: "GET"
       ref: 0) unwrap
-    self assert: (((parts at: 3) at: 3) asString) equals: "hi"
+    self assert: (MintHTTP1 stringOrOpaque: ((parts at: 3) at: 3)) equals: "hi"
     self
-      assert: (done buffer asString)
+      assert: (MintHTTP1 stringOrOpaque: (done buffer))
       equals: ("HTTP/1.1 200 OK"
         ++ self crlf
         ++ "content-length: 3"
@@ -97,8 +97,8 @@ TestCase subclass: MintParseTest
         ++ "yo!")
     next := (done withInFlightRef: 1) withInFlightMethod: "GET"
     {done2, parts2} := (next stream: 1 timeout: 1000) unwrap
-    self assert: (((parts2 at: 3) at: 3) asString) equals: "yo!"
-    self assert: done2 buffer byteSize equals: 0
+    self assert: (MintHTTP1 stringOrOpaque: ((parts2 at: 3) at: 3)) equals: "yo!"
+    self assert: (done2 buffer bitSize div: 8) equals: 0
 
   testHeadSkipsBody =>
     raw := "HTTP/1.1 200 OK"
@@ -113,7 +113,7 @@ TestCase subclass: MintParseTest
       ref: 0) unwrap
     self assert: parts size equals: 3
     self assert: (parts at: 3) equals: {#done, 0}
-    self assert: (done buffer asString) equals: "hello"
+    self assert: (MintHTTP1 stringOrOpaque: (done buffer)) equals: "hello"
 
   test204SkipsBody =>
     raw := "HTTP/1.1 204 No Content"
@@ -146,7 +146,7 @@ TestCase subclass: MintParseTest
       method: "GET"
       ref: 0) unwrap
     self assert: ((parts at: 1) at: 3) equals: 200
-    self assert: (((parts at: 3) at: 3) asString) equals: "hi"
+    self assert: (MintHTTP1 stringOrOpaque: ((parts at: 3) at: 3)) equals: "hi"
 
   testHeaderNamesLowercasedValuesKept =>
     raw := "HTTP/1.1 200 OK"
