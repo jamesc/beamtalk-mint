@@ -22,7 +22,11 @@ jobs:
 
       - name: Install Beamtalk
         run: |
-          curl -fsSL https://beamtalk.dev/install.sh | sudo sh -s -- --nightly --prefix /usr/local
+          # Pinned to v0.4.0: the nightly feed churned hourly on 2026-11-06
+          # (formatter canonical drift, then rejection of hpack 0.1.1's
+          # `_:5` bitstring syntax, which this package depends on via
+          # buccaneer). Revert to --nightly once the feed is stable again.
+          curl -fsSL https://beamtalk.dev/install.sh | sudo sh -s -- --version v0.4.0 --prefix /usr/local
           beamtalk --version
 
       - name: Install just

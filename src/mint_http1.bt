@@ -184,7 +184,7 @@ sealed typed Value subclass: MintHTTP1
         ] ifFalse: [^neg]
       ]
     proto := neg value
-    (offered anySatisfy: [:each :: String |
+    (offered anySatisfy: [:each |
       ((MintHTTP1 unwrap: each) =:= proto) or: [each =:= proto]
     ]) ifTrue: [^Result ok: nil]
     Result error: ("unexpected ALPN protocol: " ++ proto printString)
@@ -224,7 +224,7 @@ sealed typed Value subclass: MintHTTP1
     parsed := self parseStatusLine: statusLine
     parsed isError ifTrue: [^parsed]
     tail := #()
-    2 to: lines size do: [:i :: Integer | tail := tail ++ #((lines at: i))]
+    2 to: lines size do: [:i | tail := tail ++ #((lines at: i))]
     headers := self parseHeaders: tail
     headers isError ifTrue: [^headers]
     Result ok: {parsed value at: 1, parsed value at: 2, headers value}
@@ -277,7 +277,7 @@ sealed typed Value subclass: MintHTTP1
   class sealed parseHeaders: lines :: List(Binary) -> Result(List(MintHeader), Object) =>
     out :: List(MintHeader) := #()
     lines
-      do: [:line :: Binary |
+      do: [:line |
         line size =:= 0
           ifFalse: [
             parsed := self parseHeader: line
@@ -341,7 +341,7 @@ sealed typed Value subclass: MintHTTP1
     value := 0
     1
       to: text size
-      do: [:i :: Integer |
+      do: [:i |
         byte := (text byteAt: (i - 1))
         (byte >= 48 and: [
           byte <= 57
@@ -357,7 +357,7 @@ sealed typed Value subclass: MintHTTP1
     value := 0
     1
       to: text size
-      do: [:i :: Integer |
+      do: [:i |
         byte := (text byteAt: (i - 1))
         digit := self hexValue: byte
         digit isNil ifTrue: [
@@ -410,7 +410,7 @@ sealed typed Value subclass: MintHTTP1
     sent isError ifTrue: [^sent]
     1
       to: headers size
-      do: [:i :: Integer |
+      do: [:i |
         sent := self sendLine: (headers at: i)
         sent isError ifTrue: [^sent]
       ]
@@ -439,7 +439,7 @@ sealed typed Value subclass: MintHTTP1
     framed := false
     1
       to: headers size
-      do: [:i :: Integer |
+      do: [:i |
         line :: Object := headers at: i
         lower := line lowercase
         ((lower startsWith: "content-length:") =:= true) ifTrue: [
@@ -569,7 +569,7 @@ sealed typed Value subclass: MintHTTP1
   /// The first header value for a name (case-insensitive: names parse
   /// lowercase), or nil. Values are Strings or opaque Binaries.
   headerValueOf: headers :: List(MintHeader) name: want :: String -> Object =>
-    headers do: [:h :: MintHeader | h name =:= want ifTrue: [^h value]]
+    headers do: [:h | h name =:= want ifTrue: [^h value]]
     nil
 
   /// Whether a comma-separated header lists a token (case-insensitive
@@ -579,9 +579,7 @@ sealed typed Value subclass: MintHTTP1
     value isNil ifTrue: [^false]
     (value isKindOf: String) ifFalse: [^false]
     parts := value split: ","
-    parts do: [:each :: String |
-      (each trim lowercase =:= token) ifTrue: [^true]
-    ]
+    parts do: [:each | (each trim lowercase =:= token) ifTrue: [^true]]
     false
 
   /// The `content-length` value as an Integer, nil when absent.
@@ -591,7 +589,7 @@ sealed typed Value subclass: MintHTTP1
   contentLength: headers :: List(MintHeader) -> Result(Object, Object) =>
     found := nil
     headers
-      do: [:h :: MintHeader |
+      do: [:h |
         h name =:= "content-length"
           ifTrue: [
             parsed := MintHTTP1 parseDecimal: (self headerText: h value)
