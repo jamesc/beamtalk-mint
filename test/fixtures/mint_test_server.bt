@@ -1,0 +1,430 @@
+// Copyright 2026 mint authors
+// SPDX-License-Identifier: Apache-2.0
+
+/// Test-only HTTP/1 server for the `MintHTTP1` integration tests: a
+/// tiny choreographed responder over `gen_tcp` (or `ssl`), with no
+/// dependencies. The test drives both ends lock-step: it connects and
+/// sends, then `serveNext:` accepts (or reuses the kept-alive
+/// connection), reads one request, and writes the spec'd response.
+/// `acceptNext` runs the accept/handshake half for the ALPN-mismatch
+/// test, where the client never sends HTTP.
+Actor subclass: MintTestServer
+  state: lsock :: Object | Nil = nil
+  state: conn :: Object | Nil = nil
+  state: useTls = nil
+  state: rest :: Binary = Binary fromBytes: #()
+
+  /// Bind loopback port 0 (plain TCP). Answers `Result ok:` the port.
+  startPlain -> Result(Integer, Object) =>
+    raw := MintHTTP1 bare: ((Erlang gen_tcp) listen: 0 with: #(#binary, {#packet, #raw}, {#active, false}, {#reuseaddr, true}, {#ip, {127, 0, 0, 1}}))
+    raw isError ifTrue: [^raw]
+    self.lsock := raw value
+    self.useTls := false
+    self boundPort: self.lsock
+
+  /// Bind loopback port 0 over TLS (`alpn` is the advertised list, or
+  /// nil for none). Answers `Result ok:` the port.
+  startTls: certfile :: String keyfile: keyfile :: String alpn: protos -> Result(Integer, Object) =>
+    base := #(#binary, {#packet, #raw}, {#active, false}, {#reuseaddr, true}, {#ip, {127, 0, 0, 1}}, {#certfile, certfile toBytes}, {#keyfile, keyfile toBytes})
+    full := protos isNil
+      ifTrue: [base]
+      ifFalse: [
+        #(#binary, {#packet, #raw}, {#active, false}, {#reuseaddr, true}, {#ip, {127, 0, 0, 1}}, {#certfile, certfile toBytes}, {#keyfile, keyfile toBytes}, {#alpn_preferred_protocols, protos})
+      ]
+    started := MintHTTP1 bare: ((Erlang application) ensure_all_started: #ssl)
+    started isError ifTrue: [^started]
+    raw := MintHTTP1 bare: ((Erlang ssl) listen: 0 with: full)
+    raw isError ifTrue: [^raw]
+    self.lsock := raw value
+    self.useTls := true
+    named := MintHTTP1 bare: ((Erlang ssl) sockname: self.lsock)
+    named isError ifTrue: [^named]
+    {_addr, port} := named value
+    Result ok: port
+
+  /// The bound port of a plain listener.
+  boundPort: lsock -> Result(Integer, Object) =>
+    named := MintHTTP1 bare: ((Erlang inet) sockname: lsock)
+    named isError ifTrue: [^named]
+    {_addr, port} := named value
+    Result ok: port
+
+  /// Accept (and TLS-handshake) the next connection, storing it.
+  acceptNext -> Result(Nil, Object) =>
+    got := self ensureConn
+    got isError ifTrue: [^got]
+    Result ok: nil
+
+  /// Serve one request on the connection (accepting first) and answer
+  /// `Result ok:` its target. Closes the connection when the spec (a
+  /// `connection: close` response) demands it.
+  serveNext: spec -> Result(String, Object) =>
+    got := self ensureConn
+    got isError ifTrue: [^got]
+    sock := got value
+    req := self readRequest: sock
+    req isError ifTrue: [^req]
+    reqVal := req value
+    target := reqVal at: 1
+    (target isKindOf: String) ifFalse: [^Result error: "bad request target"]
+    headers := reqVal at: 2
+    (headers isKindOf: List) ifFalse: [^Result error: "bad request headers"]
+    body := reqVal at: 3
+    (body isKindOf: Binary) ifFalse: [^Result error: "bad request body"]
+    wrote := self
+      respond: spec
+      headers: headers
+      body: body
+      socket: sock
+    wrote isError ifTrue: [^wrote]
+    (self mustClose: spec) ifTrue: [self closeConn]
+    Result ok: target
+
+  /// Close the connection and listener (best effort).
+  shutdown -> Nil =>
+    self closeConn
+    self.lsock isNil
+      ifFalse: [
+        self.useTls ifTrue: [
+          (Erlang ssl) close: self.lsock
+        ] ifFalse: [(Erlang gen_tcp) close: self.lsock]
+      ]
+    self.lsock := nil
+    nil
+
+  /// The active connection, accepting (and handshaking) when needed.
+  ensureConn -> Result(Dynamic, Object) =>
+    self.conn isNil ifFalse: [^Result ok: self.conn]
+    acc := self.useTls ifTrue: [
+      MintHTTP1 bare: ((Erlang ssl) transport_accept: self.lsock timeout: 5000)
+    ] ifFalse: [
+      MintHTTP1 bare: ((Erlang gen_tcp) accept: self.lsock timeout: 5000)
+    ]
+    acc isError ifTrue: [^acc]
+    sock := acc value
+    self.useTls
+      ifTrue: [
+        hs := MintHTTP1 bare: ((Erlang ssl) handshake: sock)
+        hs isError ifTrue: [^hs]
+        sock := hs value
+      ]
+    self.conn := sock
+    Result ok: sock
+
+  /// Drop the active connection (best effort).
+  closeConn -> Nil =>
+    self.conn isNil
+      ifFalse: [
+        self.useTls ifTrue: [
+          (Erlang ssl) close: self.conn
+        ] ifFalse: [(Erlang gen_tcp) close: self.conn]
+      ]
+    self.conn := nil
+    self.rest := Binary fromBytes: #()
+    nil
+
+  // ===== Request reading =====
+
+  /// Read one request, answering `{target, headers, body}`. Extra
+  /// bytes past the body stay buffered for the next request.
+  readRequest: sock -> Result(Tuple, Object) =>
+    head := self takeHead: sock
+    head isError ifTrue: [^head]
+    lines := self splitHead: head value
+    lines isEmpty ifTrue: [^Result error: "empty request"]
+    target := self requestTarget: (lines at: 1)
+    headers := self parseReqHeaders: lines
+    headers isError ifTrue: [^headers]
+    cl := self reqContentLength: headers value
+    cl isError ifTrue: [^cl]
+    n := cl value
+    count := n isNil ifTrue: [0] ifFalse: [n]
+    body := self takeBody: count socket: sock
+    body isError ifTrue: [^body]
+    Result ok: {target, headers value, body value}
+
+  /// Read through the request head, answering the head bytes.
+  takeHead: sock -> Result(Binary, Object) =>
+    self takeHeadLoop: sock buf: self.rest
+
+  /// Pump `recv` until the head terminator arrives, answering the
+  /// head bytes (extra bytes stay buffered for the next request).
+  takeHeadLoop: sock buf: buf :: Binary -> Result(Binary, Object) =>
+    at := MintHTTP1 indexOf: MintHTTP1 headTerminator in: buf
+    at isNil
+      ifFalse: [
+        self.rest := buf part: (at + 3) size: (buf byteSize - at - 3)
+        ^Result ok: (buf part: 0 size: (at - 1))
+      ]
+    chunk := self recv: sock
+    chunk isError ifTrue: [^chunk]
+    self takeHeadLoop: sock buf: (buf concat: chunk value)
+
+  /// Read exactly `n` body bytes.
+  takeBody: n :: Integer socket: sock -> Result(Binary, Object) =>
+    n =:= 0 ifTrue: [^Result ok: (Binary fromBytes: #())]
+    self takeBodyLoop: n socket: sock
+
+  /// Pump `recv` until `n` bytes buffer, answering them exactly.
+  takeBodyLoop: n :: Integer socket: sock -> Result(Binary, Object) =>
+    self.rest byteSize >= n
+      ifTrue: [
+        body := self.rest part: 0 size: n
+        self.rest := self.rest part: n size: (self.rest byteSize - n)
+        ^Result ok: body
+      ]
+    chunk := self recv: sock
+    chunk isError ifTrue: [^chunk]
+    self.rest := self.rest concat: chunk value
+    self takeBodyLoop: n socket: sock
+
+  /// Split head bytes on CRLF.
+  splitHead: head :: Binary -> List(Binary) =>
+    at := MintHTTP1 indexOf: MintHTTP1 lineTerminator in: head
+    at isNil ifTrue: [^#(head)]
+    #((head part: 0 size: (at - 1)))
+      ++ (self splitHead: (head part: (at + 1) size: (head byteSize - at - 1)))
+
+  /// The target of a `METHOD SP TARGET SP VERSION` line.
+  requestTarget: line :: Binary -> String =>
+    first := MintHTTP1 indexOf: " " in: line
+    first isNil ifTrue: [^line asStringUnchecked]
+    tail := line part: first size: (line byteSize - first)
+    second := MintHTTP1 indexOf: " " in: tail
+    second isNil ifTrue: [^line asStringUnchecked]
+    (tail part: 0 size: (second - 1)) asStringUnchecked
+
+  /// Parse the header lines (skipping the request line).
+  parseReqHeaders: lines :: List(Binary) -> Result(List(MintHeader), Object) =>
+    lines size < 2 ifTrue: [^Result ok: #()]
+    self
+      parseReqTail: lines
+      from: 2
+      into: #()
+
+  /// The loop behind `parseReqHeaders:` (recursion keeps every
+  /// step in plain method frames).
+  parseReqTail: lines :: List(Binary) from: i :: Integer into: out :: List(MintHeader) -> Result(List(MintHeader), Object) =>
+    i > lines size ifTrue: [^Result ok: out]
+    parsed := self parseReqHeader: (lines at: i)
+    parsed isError ifTrue: [^parsed]
+    self
+      parseReqTail: lines
+      from: (i + 1)
+      into: (out ++ #(parsed value))
+
+  /// Parse one `name: value` line (names lowercase; values raw bytes,
+  /// OWS-stripped, for exact echoes).
+  parseReqHeader: line :: Binary -> Result(MintHeader, Object) =>
+    at := MintHTTP1 indexOf: ":" in: line
+    at isNil ifTrue: [^Result error: "malformed header line"]
+    nameText := MintHTTP1 stringOrOpaque: (line part: 0 size: at - 1)
+    (nameText isKindOf: String) ifFalse: [
+      ^Result error: "header name is not UTF-8"
+    ]
+    name := nameText lowercase
+    name byteSize =:= 0 ifTrue: [^Result error: "empty header name"]
+    raw := line part: at size: (line byteSize - at)
+    Result ok: (MintHeader name: name value: (MintHTTP1 stripOws: raw))
+
+  /// The request `content-length` as an Integer, nil when absent.
+  reqContentLength: headers :: List(MintHeader) -> Result(Integer | Nil, Object) =>
+    headers
+      do: [:h |
+        h name =:= "content-length"
+          ifTrue: [
+            parsed := MintHTTP1 parseDecimal: h value
+            parsed isError ifTrue: [^parsed]
+            ^Result ok: parsed value
+          ]
+      ]
+    Result ok: nil
+
+  /// Receive available bytes.
+  recv: sock -> Result(Binary, Object) =>
+    raw := self.useTls
+      ifTrue: [
+        MintHTTP1
+          bare: ((Erlang ssl)
+            recv: sock
+            with: 0
+            with: 5000)
+      ]
+      ifFalse: [
+        MintHTTP1
+          bare: ((Erlang gen_tcp)
+            recv: sock
+            with: 0
+            with: 5000)
+      ]
+    raw isError ifTrue: [^Result error: raw error]
+    Result ok: raw value
+
+  // ===== Responding =====
+
+  /// Write the spec'd response: `{#resp, status, headers, body}`,
+  /// `#echo` (the request body), `{#echoHeader, name}`, or
+  /// `{#chunked, pieces}` (Strings or Binaries).
+  respond: spec headers: headers :: List body: body :: Binary socket: sock -> Result(Nil, Object) =>
+    spec =:= #echo
+      ifTrue: [
+        ^self
+          sendResponse: 200
+          headers: #()
+          body: body
+          socket: sock
+      ]
+    (spec isKindOf: Tuple) ifFalse: [^Result error: "bad response spec"]
+    tag := spec at: 1
+    tag =:= #resp
+      ifTrue: [
+        st := spec at: 2
+        (st isKindOf: Integer) ifFalse: [^Result error: "bad response status"]
+        hdrs := spec at: 3
+        (hdrs isKindOf: List) ifFalse: [^Result error: "bad response headers"]
+        b := spec at: 4
+        bodyBin := (b isKindOf: Binary) ifTrue: [
+          b
+        ] ifFalse: [Binary fromBytes: #()]
+        (bodyBin isKindOf: Binary) ifFalse: [^Result error: "bad response body"]
+        ^self
+          sendResponse: st
+          headers: hdrs
+          body: bodyBin
+          socket: sock
+      ]
+    tag =:= #echoHeader
+      ifTrue: [
+        want := spec at: 2
+        (want isKindOf: String) ifFalse: [^Result error: "bad echo header"]
+        found := self findHeader: headers name: want
+        ^self
+          sendResponse: 200
+          headers: #()
+          body: ((found isKindOf: Binary) ifTrue: [
+            found
+          ] ifFalse: [Binary fromBytes: #()])
+          socket: sock
+      ]
+    tag =:= #chunked
+      ifTrue: [
+        pieces := spec at: 2
+        (pieces isKindOf: List) ifFalse: [^Result error: "bad chunked pieces"]
+        ^self sendChunked: pieces socket: sock
+      ]
+    Result error: "bad response spec"
+
+  /// The raw value of the first header with `name`, or nil.
+  findHeader: headers :: List name: want :: String -> Object =>
+    headers do: [:h |
+      (h isKindOf: MintHeader) ifTrue: [h name =:= want ifTrue: [^h value]]
+    ]
+    nil
+
+  /// Send a framed response, adding `content-length` for a non-empty
+  /// body without framing (never for 204).
+  sendResponse: status :: Integer headers: headers :: List body: body :: Binary socket: sock -> Result(Nil, Object) =>
+    head := "HTTP/1.1 "
+      ++ status printString
+      ++ " "
+      ++ (self reasonOf: status)
+      ++ MintHTTP1 crlf
+    head := head ++ (self renderHeaders: headers body: body)
+    head := head ++ MintHTTP1 crlf
+    sent := self send: head socket: sock
+    sent isError ifTrue: [^sent]
+    self send: body socket: sock
+
+  /// Render header lines plus an automatic `content-length`.
+  renderHeaders: headers body: body :: Binary -> String =>
+    out := ""
+    framed := false
+    headers
+      do: [:line |
+        (line isKindOf: String)
+          ifTrue: [
+            out := out ++ line ++ MintHTTP1 crlf
+            lower := line lowercase
+            ((lower startsWith: "content-length:") or: [
+              lower startsWith: "transfer-encoding:"
+            ]) ifTrue: [framed := true]
+          ]
+      ]
+    (framed not and: [body byteSize > 0])
+      ifTrue: [
+        out := out ++ "content-length: " ++ body byteSize printString ++ MintHTTP1 crlf
+      ]
+    out
+
+  /// Send a chunked response.
+  sendChunked: pieces socket: sock -> Result(Nil, Object) =>
+    (pieces isKindOf: List) ifFalse: [^Result error: "bad chunked pieces"]
+    sent := self
+      send: ("HTTP/1.1 200 OK"
+        ++ MintHTTP1 crlf
+        ++ "transfer-encoding: chunked"
+        ++ MintHTTP1 crlf
+        ++ MintHTTP1 crlf)
+      socket: sock
+    sent isError ifTrue: [^sent]
+    pieces
+      do: [:piece |
+        bytes := (piece isKindOf: Binary) ifTrue: [
+          piece
+        ] ifFalse: [Binary fromBytes: #()]
+        (bytes isKindOf: Binary) ifFalse: [^Result error: "bad chunked piece"]
+        sent := self send: ((self hexOf: bytes byteSize) ++ MintHTTP1 crlf) socket: sock
+        sent isError ifTrue: [^sent]
+        sent := self send: bytes socket: sock
+        sent isError ifTrue: [^sent]
+        sent := self send: MintHTTP1 crlf socket: sock
+        sent isError ifTrue: [^sent]
+      ]
+    self send: ("0" ++ MintHTTP1 crlf ++ MintHTTP1 crlf) socket: sock
+
+  /// Whether the response spec closes the connection.
+  mustClose: spec -> Boolean =>
+    (spec isKindOf: Tuple) ifFalse: [^false]
+    (spec at: 1) =:= #resp ifFalse: [^false]
+    lines := spec at: 3
+    (lines isKindOf: List) ifFalse: [^false]
+    lines
+      do: [:line |
+        (line isKindOf: String)
+          ifTrue: [
+            (line lowercase startsWith: "connection:")
+              ifTrue: [
+                val := (line lowercase split: ":") at: 2
+                (val trim =:= "close") ifTrue: [^true]
+              ]
+          ]
+      ]
+    false
+
+  /// Send bytes on the connection.
+  send: bytes :: Binary socket: sock -> Result(Nil, Object) =>
+    sent := self.useTls ifTrue: [
+      MintHTTP1 bare: ((Erlang ssl) send: sock with: bytes)
+    ] ifFalse: [MintHTTP1 bare: ((Erlang gen_tcp) send: sock with: bytes)]
+    sent isError ifTrue: [^sent]
+    Result ok: nil
+
+  /// A status reason phrase.
+  reasonOf: status :: Integer -> String =>
+    status =:= 200 ifTrue: [^"OK"]
+    status =:= 204 ifTrue: [^"No Content"]
+    status =:= 404 ifTrue: [^"Not Found"]
+    ""
+
+  /// Hexadecimal rendering of a non-negative Integer.
+  hexOf: n :: Integer -> String =>
+    n =:= 0 ifTrue: [^"0"]
+    digits := "0123456789abcdef"
+    out := ""
+    rest := n
+    [rest > 0]
+      whileTrue: [
+        out := (digits at: (rest - ((rest div: 16) * 16) + 1)) ++ out
+        rest := rest div: 16
+      ]
+    out
