@@ -1,0 +1,11 @@
+# Copyright 2026 mint authors
+# SPDX-License-Identifier: Apache-2.0
+
+# Scratch spike package for BT-4527. Deleted after the decision.
+# Not published; the http dep exists only for the gun baseline arm.
+[package]
+name = "connect_spike"
+version = "0.1.0"
+
+[dependencies]
+http = { path = "../../../beamtalk-http" }

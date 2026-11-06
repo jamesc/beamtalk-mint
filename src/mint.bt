@@ -1,0 +1,8 @@
+// Copyright 2026 mint authors
+// SPDX-License-Identifier: Apache-2.0
+
+/// Mint — main class for the mint library.
+Object subclass: Mint
+
+  /// Return a greeting string.
+  class greet => "Hello from mint!"

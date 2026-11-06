@@ -1,0 +1,10 @@
+# Build outputs (any depth: spike packages nest their own)
+**/_build/
+*.beam
+*.core
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo

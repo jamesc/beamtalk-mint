@@ -1,0 +1,6 @@
+// Copyright 2026 mint authors
+// SPDX-License-Identifier: Apache-2.0
+
+TestCase subclass: MintTest
+
+  testBasic => self assert: (Mint greet) equals: "Hello from mint!"
