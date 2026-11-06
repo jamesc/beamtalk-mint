@@ -29,7 +29,9 @@ Actor subclass: MintTestServer
     full := protos isNil
       ifTrue: [base]
       ifFalse: [
-        #(#binary, {#packet, #raw}, {#active, false}, {#reuseaddr, true}, {#ip, {127, 0, 0, 1}}, {#certfile, certfile toBytes}, {#keyfile, keyfile toBytes}, {#alpn_preferred_protocols, protos})
+        #(#binary, {#packet, #raw}, {#active, false}, {#reuseaddr, true}, {#ip, {127, 0, 0, 1}}, {#certfile, certfile toBytes}, {#keyfile, keyfile toBytes}, {#alpn_preferred_protocols, (protos collect: [:p |
+          Binary fromIolist: p
+        ])})
       ]
     started := MintHTTP1 bare: ((Erlang application) ensure_all_started: #ssl)
     started isError ifTrue: [^started]
@@ -153,7 +155,7 @@ Actor subclass: MintTestServer
     at := MintHTTP1 indexOf: MintHTTP1 headTerminator in: buf
     at isNil
       ifFalse: [
-        self.rest := buf part: (at + 3) size: (buf byteSize - at - 3)
+        self.rest := buf part: (at + 3) size: ((buf bitSize div: 8) - at - 3)
         ^Result ok: (buf part: 0 size: (at - 1))
       ]
     chunk := self recv: sock
@@ -167,10 +169,10 @@ Actor subclass: MintTestServer
 
   /// Pump `recv` until `n` bytes buffer, answering them exactly.
   takeBodyLoop: n :: Integer socket: sock -> Result(Binary, Object) =>
-    self.rest byteSize >= n
+    (self.rest bitSize div: 8) >= n
       ifTrue: [
         body := self.rest part: 0 size: n
-        self.rest := self.rest part: n size: (self.rest byteSize - n)
+        self.rest := self.rest part: n size: ((self.rest bitSize div: 8) - n)
         ^Result ok: body
       ]
     chunk := self recv: sock
@@ -183,13 +185,13 @@ Actor subclass: MintTestServer
     at := MintHTTP1 indexOf: MintHTTP1 lineTerminator in: head
     at isNil ifTrue: [^#(head)]
     #((head part: 0 size: (at - 1)))
-      ++ (self splitHead: (head part: (at + 1) size: (head byteSize - at - 1)))
+      ++ (self splitHead: (head part: (at + 1) size: ((head bitSize div: 8) - at - 1)))
 
   /// The target of a `METHOD SP TARGET SP VERSION` line.
   requestTarget: line :: Binary -> String =>
     first := MintHTTP1 indexOf: " " in: line
     first isNil ifTrue: [^line asStringUnchecked]
-    tail := line part: first size: (line byteSize - first)
+    tail := line part: first size: ((line bitSize div: 8) - first)
     second := MintHTTP1 indexOf: " " in: tail
     second isNil ifTrue: [^line asStringUnchecked]
     (tail part: 0 size: (second - 1)) asStringUnchecked
@@ -223,8 +225,8 @@ Actor subclass: MintTestServer
       ^Result error: "header name is not UTF-8"
     ]
     name := nameText lowercase
-    name byteSize =:= 0 ifTrue: [^Result error: "empty header name"]
-    raw := line part: at size: (line byteSize - at)
+    (name bitSize div: 8) =:= 0 ifTrue: [^Result error: "empty header name"]
+    raw := line part: at size: ((line bitSize div: 8) - at)
     Result ok: (MintHeader name: name value: (MintHTTP1 stripOws: raw))
 
   /// The request `content-length` as an Integer, nil when absent.
@@ -350,9 +352,9 @@ Actor subclass: MintTestServer
             ]) ifTrue: [framed := true]
           ]
       ]
-    (framed not and: [body byteSize > 0])
+    (framed not and: [((body bitSize div: 8)) > 0])
       ifTrue: [
-        out := out ++ "content-length: " ++ body byteSize printString ++ MintHTTP1 crlf
+        out := out ++ "content-length: " ++ (body bitSize div: 8) printString ++ MintHTTP1 crlf
       ]
     out
 
@@ -373,7 +375,7 @@ Actor subclass: MintTestServer
           piece
         ] ifFalse: [Binary fromBytes: #()]
         (bytes isKindOf: Binary) ifFalse: [^Result error: "bad chunked piece"]
-        sent := self send: ((self hexOf: bytes byteSize) ++ MintHTTP1 crlf) socket: sock
+        sent := self send: ((self hexOf: (bytes bitSize div: 8)) ++ MintHTTP1 crlf) socket: sock
         sent isError ifTrue: [^sent]
         sent := self send: bytes socket: sock
         sent isError ifTrue: [^sent]

@@ -8,9 +8,9 @@
 build:
     beamtalk build
 
-# Run the test suite
+# Run the test suite (warnings and hints are errors)
 test:
-    beamtalk test
+    beamtalk test --warnings-as-errors
 
 # Check formatting
 fmt:

@@ -79,21 +79,27 @@ sealed typed Value subclass: MintHTTP1
     (raw isKindOf: Symbol) ifFalse: [Error signal: "verify must be a Symbol"]
     raw
 
-  /// The `#alpn` option: a List of Strings, default `defaultAlpn`.
-  class sealed alpnOf: opts :: Dictionary(Symbol, Object) -> List(String) =>
-    raw := opts at: #alpn ifAbsent: [^self defaultAlpn]
+  /// The `#alpn` option as raw Binaries (Erlang compares them
+  /// against raw binaries; tagged Strings never match). The user
+  /// passes a List of Strings, default `defaultAlpn`.
+  class sealed alpnOf: opts :: Dictionary(Symbol, Object) -> List(Binary) =>
+    raw := opts at: #alpn ifAbsent: [
+      ^(self defaultAlpn collect: [:each | Binary fromIolist: each])
+    ]
     (raw isKindOf: List) ifFalse: [
       Error signal: "alpn must be a List of Strings"
     ]
-    raw
+    strings :: List(String) := raw
+    strings collect: [:each | Binary fromIolist: each]
 
-  /// The SNI hostname for a DNS-name host, nil for an IP literal
+  /// The SNI value for a DNS-name host, nil for an IP literal
   /// (SNI must not carry an IP: Erlang rejects it, and it stalls
-  /// ALPN handshakes against our test server).
-  class sealed sniOf: host :: String -> String | Nil =>
+  /// ALPN handshakes against our test server). A raw Binary: a
+  /// tagged String never matches in Erlang comparisons.
+  class sealed sniOf: host :: String -> Binary | Nil =>
     parsed := MintHTTP1 bare: ((Erlang inet) parse_address: (host toBytes))
     parsed isOk ifTrue: [^nil]
-    host
+    Binary fromIolist: host
 
   /// The CRLF CRLF bytes ending a response head.
   class sealed headTerminator -> Binary => Binary fromBytes: #(13, 10, 13, 10)
@@ -201,7 +207,7 @@ sealed typed Value subclass: MintHTTP1
   /// negotiation (`#protocol_not_negotiated`, a server without ALPN)
   /// proceeds; any other transport error propagates; a negotiated
   /// protocol outside the offered list is an error.
-  class sealed checkAlpn: neg :: Result(Dynamic, Object) offered: offered :: List(String) -> Result(Nil, Object) =>
+  class sealed checkAlpn: neg :: Result(Dynamic, Object) offered: offered :: List(Binary) -> Result(Nil, Object) =>
     neg isError
       ifTrue: [
         neg error =:= #protocol_not_negotiated ifTrue: [
@@ -262,31 +268,36 @@ sealed typed Value subclass: MintHTTP1
         at := self indexOf: MintHTTP1 lineTerminator in: rest
         at isNil ifTrue: [^out ++ #(rest)]
         out := out ++ #((rest part: 0 size: (at - 1)))
-        rest := rest part: (at + 1) size: (rest byteSize - at - 1)
+        rest := rest part: (at + 1) size: ((rest bitSize div: 8) - at - 1)
       ]
     out
 
   /// The 1-based byte offset of `needle` in `hay`, or nil for an
   /// empty needle or no match. (A byte under 128 never appears inside
   /// a multi-byte UTF-8 sequence, so ASCII delimiters are byte-safe.)
-  /// `byteSize`, never `size`: `size` counts characters, so real
-  /// CRLF CRLF bytes report 2, which truncates the scan.
-  /// `==` (not `=:=`) so String and Binary needles both match.
+  /// Byte counts via `bitSize div: 8`, never `size`: `size`
+  /// counts characters, so real CRLF CRLF bytes report 2, which
+  /// truncates the scan. (`bitSize` answers bits per ADR 0141.)
+  /// The needle normalizes to a raw Binary first: on toolchains
+  /// with tagged Strings, a String never `=:=` a Binary slice.
   class sealed indexOf: needle :: String | Binary in: hay :: Binary -> Integer | Nil =>
-    needle byteSize =:= 0 ifTrue: [^nil]
-    last := hay byteSize - needle byteSize
+    raw :: Binary := (needle isKindOf: String) ifTrue: [
+      Binary fromIolist: needle
+    ] ifFalse: [needle]
+    (raw bitSize div: 8) =:= 0 ifTrue: [^nil]
+    last := (hay bitSize div: 8) - (raw bitSize div: 8)
     last < 0 ifTrue: [^nil]
     self
-      indexOf: needle
+      indexOf: raw
       in: hay
       from: 0
       to: last
 
   /// The scan behind `indexOf:in:` (recursion keeps every step in
   /// plain method frames).
-  class sealed indexOf: needle :: String | Binary in: hay :: Binary from: i :: Integer to: last :: Integer -> Integer | Nil =>
+  class sealed indexOf: needle :: Binary in: hay :: Binary from: i :: Integer to: last :: Integer -> Integer | Nil =>
     i > last ifTrue: [^nil]
-    ((hay part: i size: needle byteSize) == needle) ifTrue: [^(i + 1)]
+    ((hay part: i size: (needle bitSize div: 8)) =:= needle) ifTrue: [^(i + 1)]
     self
       indexOf: needle
       in: hay
@@ -341,7 +352,7 @@ sealed typed Value subclass: MintHTTP1
     out :: List(MintHeader) := #()
     lines
       do: [:line |
-        line byteSize =:= 0
+        (line bitSize div: 8) =:= 0
           ifFalse: [
             parsed := self parseHeader: line
             parsed isError ifTrue: [^parsed]
@@ -359,8 +370,8 @@ sealed typed Value subclass: MintHTTP1
       ^Result error: "header name is not UTF-8"
     ]
     trimmed := nameText trim lowercase
-    trimmed byteSize =:= 0 ifTrue: [^Result error: "empty header name"]
-    raw := line part: at size: (line byteSize - at)
+    (trimmed bitSize div: 8) =:= 0 ifTrue: [^Result error: "empty header name"]
+    raw := line part: at size: ((line bitSize div: 8) - at)
     value := self stringOrOpaque: raw
     Result
       ok: (MintHeader name: trimmed value: ((value isKindOf: String) ifTrue: [
@@ -371,12 +382,12 @@ sealed typed Value subclass: MintHTTP1
   /// non-UTF-8 header values, where `trim` cannot run).
   class sealed stripOws: bytes :: Binary -> Binary =>
     start := self owsStart: bytes at: 0
-    stop := self owsEnd: bytes at: bytes byteSize
+    stop := self owsEnd: bytes at: (bytes bitSize div: 8)
     bytes part: start size: stop - start
 
   /// The first index that is not a space or tab.
   class sealed owsStart: bytes :: Binary at: i :: Integer -> Integer =>
-    i >= bytes byteSize ifTrue: [^i]
+    i >= (bytes bitSize div: 8) ifTrue: [^i]
     byte := bytes byteAt: i
     ((byte =:= 32) or: [
       byte =:= 9
@@ -396,16 +407,16 @@ sealed typed Value subclass: MintHTTP1
     (text isKindOf: String) ifFalse: [^Result error: "chunk size is not UTF-8"]
     bare := (text split: ";") at: 1
     trimmed := bare trim
-    trimmed byteSize =:= 0 ifTrue: [^Result error: "empty chunk size"]
-    trimmed byteSize > 16 ifTrue: [^Result error: "chunk size too long"]
+    (trimmed bitSize div: 8) =:= 0 ifTrue: [^Result error: "empty chunk size"]
+    (trimmed bitSize div: 8) > 16 ifTrue: [^Result error: "chunk size too long"]
     self parseHex: trimmed
 
   /// Parse a non-empty decimal digit string. Anything else is an error.
   class sealed parseDecimal: text :: String | Binary -> Result(Integer, Object) =>
-    text byteSize =:= 0 ifTrue: [^Result error: "empty integer"]
+    (text bitSize div: 8) =:= 0 ifTrue: [^Result error: "empty integer"]
     value := 0
     1
-      to: text byteSize
+      to: (text bitSize div: 8)
       do: [:i |
         byte := (text byteAt: (i - 1))
         (byte >= 48 and: [
@@ -418,10 +429,10 @@ sealed typed Value subclass: MintHTTP1
 
   /// Parse a non-empty hexadecimal digit string. Anything else errors.
   class sealed parseHex: text :: String | Binary -> Result(Integer, Object) =>
-    text byteSize =:= 0 ifTrue: [^Result error: "empty integer"]
+    (text bitSize div: 8) =:= 0 ifTrue: [^Result error: "empty integer"]
     value := 0
     1
-      to: text byteSize
+      to: (text bitSize div: 8)
       do: [:i |
         byte := (text byteAt: (i - 1))
         digit := self hexValue: byte
@@ -483,7 +494,7 @@ sealed typed Value subclass: MintHTTP1
     framed
       ifFalse: [
         wire := body
-        sent := self sendLine: "content-length: " ++ wire byteSize printString
+        sent := self sendLine: "content-length: " ++ (wire bitSize div: 8) printString
         sent isError ifTrue: [^sent]
       ]
     sent := self send: MintHTTP1 crlf
@@ -557,7 +568,9 @@ sealed typed Value subclass: MintHTTP1
     conn2 := body value at: 1
     bytes := body value at: 2
     parts :: List(Tuple) := #({#status, ref, status}, {#headers, ref, headers})
-    bytes byteSize > 0 ifTrue: [parts := parts ++ #({#data, ref, bytes})]
+    (bytes bitSize div: 8) > 0 ifTrue: [
+      parts := parts ++ #({#data, ref, bytes})
+    ]
     parts := parts ++ #({#done, ref})
     idle := (conn2 withInFlightRef: nil) withInFlightMethod: ""
     Result ok: {(idle withClosedWhen: version headers: headers), parts}
@@ -594,7 +607,7 @@ sealed typed Value subclass: MintHTTP1
         ^(self withBuffer: (self buffer concat: chunk value)) readHead: ms
       ]
     head := self buffer part: 0 size: (found - 1)
-    rest := self buffer part: (found + 3) size: (self buffer byteSize - found - 3)
+    rest := self buffer part: (found + 3) size: ((self buffer bitSize div: 8) - found - 3)
     parsed := MintHTTP1 parseHead: head
     parsed isError ifTrue: [^parsed]
     version := parsed value at: 1
@@ -681,7 +694,7 @@ sealed typed Value subclass: MintHTTP1
   /// `Result ok:` with `{conn, body}`; short buffered data (a test-only
   /// connection past its end) answers a truncation error.
   readExactly: n :: Integer ms: ms :: Integer -> Result(Tuple, Object) =>
-    have := self buffer byteSize
+    have := (self buffer bitSize div: 8)
     have >= n
       ifTrue: [
         ^Result ok: {self withBuffer: (self buffer part: n size: (have - n)), self buffer part: 0 size: n}
@@ -721,14 +734,14 @@ sealed typed Value subclass: MintHTTP1
         ^(self withBuffer: (self buffer concat: chunk value)) readLine: ms
       ]
     found > 129 ifTrue: [^Result error: "line too long"]
-    Result ok: {self withBuffer: (self buffer part: (found + 1) size: (self buffer byteSize - found - 1)), self buffer part: 0 size: (found - 1)}
+    Result ok: {self withBuffer: (self buffer part: (found + 1) size: ((self buffer bitSize div: 8) - found - 1)), self buffer part: 0 size: (found - 1)}
 
   /// Consume trailer lines through the empty line, discarding them.
   readTrailers: ms :: Integer body: body :: Binary -> Result(Tuple, Object) =>
     line := self readLine: ms
     line isError ifTrue: [^line]
     rest := line value at: 2
-    rest byteSize =:= 0 ifTrue: [
+    (rest bitSize div: 8) =:= 0 ifTrue: [
       ^Result ok: {line value at: 1, body}
     ] ifFalse: [^(line value at: 1) readTrailers: ms body: body]
 
