@@ -1,0 +1,182 @@
+// Copyright 2026 mint authors
+// SPDX-License-Identifier: Apache-2.0
+
+/// `MintHTTP1` integration tests against a local Buccaneer server:
+/// round-trips, keep-alive reuse, `connection: close`, chunked
+/// responses from `sendChunked:`, empty bodies, and the request-side
+/// guards. Each test starts its own server on an ephemeral port.
+TestCase subclass: MintConnectionTest
+  field: srv = nil
+  field: port = 0
+
+  setUp =>
+    self.srv := (Buccaneer
+      start: #{#port => 0, #startupLog => false, #handler => [:ex |
+          path := ex path
+          path match: [
+            "/plain" -> ex
+              sendResp: 200
+              headers: #()
+              body: "hi";
+            "/echo" -> ex
+              sendResp: 200
+              headers: #()
+              body: (ex readAll: 8000000) value;
+            "/headers" -> ex
+              sendResp: 200
+              headers: #()
+              body: (ex header: "x-echo") asStringUnchecked;
+            "/chunked" -> self serveChunked: ex;
+            "/close" -> ex
+              sendResp: 200
+              headers: #({"connection", "close"})
+              body: "bye";
+            "/empty204" -> ex
+              sendResp: 204
+              headers: #()
+              body: "";
+            _ -> ex
+              sendResp: 404
+              headers: #()
+              body: "nope"
+          ]
+        ]}) unwrap
+    self.port := (self.srv listenerInfo unwrap) at: 2
+    self
+
+  tearDown => self.srv isNil ifFalse: [self.srv stop: 5000]
+
+  serveChunked: ex =>
+    ex sendChunked: 200 headers: #()
+    (ex chunk: "Wiki") unwrap
+    (ex chunk: "pedia") unwrap
+    (ex chunk: "") unwrap
+    ex
+
+  connect => (MintHTTP1 connect: "127.0.0.1" port: self.port) unwrap
+
+  get: target =>
+    conn := self connect
+    {live, ref} := (conn
+      request: "GET"
+      target: target
+      headers: #()
+      body: "") unwrap
+    (live stream: ref timeout: 5000) unwrap
+
+  bodyOf: parts => (((parts at: 3) at: 3) asString) unwrap
+
+  testGetRoundTrip =>
+    {done, parts} := self get: "/plain"
+    self assert: parts size equals: 4
+    self assert: ((parts at: 1) at: 1) equals: #status
+    self assert: ((parts at: 1) at: 3) equals: 200
+    self assert: ((parts at: 2) at: 1) equals: #headers
+    self assert: ((((parts at: 2) at: 3) at: 1) isKindOf: MintHeader)
+    self assert: ((parts at: 3) at: 1) equals: #data
+    self assert: (self bodyOf: parts) equals: "hi"
+    self assert: ((parts at: 4) at: 1) equals: #done
+    self assert: ((parts at: 4) at: 2) equals: ((parts at: 1) at: 2)
+    self assert: done isOpen
+    done close
+    self assert: parts size equals: 4
+
+  testRefsTagTheirParts =>
+    {_ignored, parts} := self get: "/plain"
+    ref := ((parts at: 1) at: 2)
+    seen := 0
+    1
+      to: parts size
+      do: [:i |
+        self assert: ((parts at: i) at: 2) equals: ref
+        seen := seen + 1
+      ]
+    self assert: seen equals: parts size
+
+  testPostEchoesBody =>
+    conn := self connect
+    {live, ref} := (conn
+      request: "POST"
+      target: "/echo"
+      headers: #()
+      body: "beamtalk") unwrap
+    {_ignored, parts} := (live stream: ref timeout: 5000) unwrap
+    self assert: (self bodyOf: parts) equals: "beamtalk"
+    live close
+    self assert: ((parts at: 1) at: 3) equals: 200
+
+  testCustomRequestHeader =>
+    conn := self connect
+    {live, ref} := (conn
+      request: "GET"
+      target: "/headers"
+      headers: #("x-echo: ping")
+      body: "") unwrap
+    {_ignored, parts} := (live stream: ref timeout: 5000) unwrap
+    self assert: (self bodyOf: parts) equals: "ping"
+    live close
+    self assert: ((parts at: 1) at: 3) equals: 200
+
+  testLowercaseMethodWorks =>
+    conn := self connect
+    {live, ref} := (conn
+      request: "get"
+      target: "/plain"
+      headers: #()
+      body: "") unwrap
+    {_ignored, parts} := (live stream: ref timeout: 5000) unwrap
+    self assert: ((parts at: 1) at: 3) equals: 200
+    live close
+    self assert: parts size equals: 4
+
+  testKeepAliveReuse =>
+    conn := self connect
+    {live, ref} := (conn
+      request: "GET"
+      target: "/plain"
+      headers: #()
+      body: "") unwrap
+    {idle, _ignored} := (live stream: ref timeout: 5000) unwrap
+    self assert: idle isOpen
+    {live2, ref2} := (idle
+      request: "GET"
+      target: "/plain"
+      headers: #()
+      body: "") unwrap
+    self assert: ref2 equals: ref + 1
+    {done, parts} := (live2 stream: ref2 timeout: 5000) unwrap
+    self assert: ((parts at: 1) at: 3) equals: 200
+    self assert: (self bodyOf: parts) equals: "hi"
+    done close
+    self assert: done isOpen
+
+  testConnectionCloseEndsIt =>
+    {done, parts} := self get: "/close"
+    self assert: ((parts at: 1) at: 3) equals: 200
+    self assert: (self bodyOf: parts) equals: "bye"
+    self deny: done isOpen
+
+  testChunkedFromServer =>
+    {_ignored, parts} := self get: "/chunked"
+    self assert: ((parts at: 1) at: 3) equals: 200
+    self assert: (self bodyOf: parts) equals: "Wikipedia"
+
+  testEmpty204HasNoData =>
+    {_ignored, parts} := self get: "/empty204"
+    self assert: ((parts at: 1) at: 3) equals: 204
+    self assert: parts size equals: 3
+
+  testSecondRequestWhileInFlightIsError =>
+    conn := self connect
+    {live, _ignored} := (conn
+      request: "GET"
+      target: "/plain"
+      headers: #()
+      body: "") unwrap
+    result := live
+      request: "GET"
+      target: "/plain"
+      headers: #()
+      body: ""
+    live close
+    self deny: result isOk

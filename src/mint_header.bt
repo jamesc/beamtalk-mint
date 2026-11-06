@@ -1,0 +1,12 @@
+// Copyright 2026 mint authors
+// SPDX-License-Identifier: Apache-2.0
+
+/// MintHeader — one HTTP header: a lowercase name and its value.
+///
+/// Values are Strings, or opaque Binaries when the bytes are not
+/// valid UTF-8 (buccaneer's `HttpHeaders` convention: a `String`
+/// never `equals:` a `Binary`, so non-UTF-8 bytes stay binary rather
+/// than decoding lossy).
+sealed typed Value subclass: MintHeader
+  field: name :: String = ""
+  field: value :: String | Binary = ""

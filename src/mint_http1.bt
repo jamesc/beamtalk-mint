@@ -1,0 +1,707 @@
+// Copyright 2026 mint authors
+// SPDX-License-Identifier: Apache-2.0
+
+/// MintHTTP1 — a processless HTTP/1.1 client connection, a port of
+/// `Mint.HTTP1` (BT-4528).
+///
+/// The connection is a `Value`: every operation threads it through and
+/// answers an updated copy, exactly like Mint threads its `conn`. There
+/// is no process, no socket ownership transfer, no `active: :once`
+/// pump — the socket stays passive and `stream` blocks in `recv`
+/// until the response completes.
+///
+/// ## Usage
+///
+/// ```beamtalk
+/// conn := (MintHTTP1 connect: "127.0.0.1" port: 8080) unwrap.
+/// {live, ref} := (conn request: "GET" target: "/" headers: #() body: "") unwrap.
+/// {done, parts} := (live stream: ref timeout: 5000) unwrap.
+/// // parts: {#status, ref, 200}, {#headers, ref, headers}, {#data, ref, body}, {#done, ref}
+/// done close.
+/// ```
+///
+/// ## Framing
+///
+/// The response body is framed by (in order): the request method and
+/// status (`HEAD`, `204`, `304` and `1xx` never carry a body),
+/// `transfer-encoding: chunked`, `content-length`, or close-delimited
+/// (read until the server closes). `trailers` after a zero chunk are
+/// consumed and discarded.
+///
+/// ## Keep-alive
+///
+/// A connection stays open for the next request unless the response
+/// demands otherwise (`connection: close`, or HTTP/1.0 without
+/// `connection: keep-alive`). Leftover bytes after a body stay in
+/// `buffer`, so pipelined bytes are never lost. Only one request may
+/// be in flight at a time; `request` answers `#already_in_flight`
+/// otherwise. On any transport error the connection is unusable —
+/// drop it and `close` (best effort).
+///
+/// ## TLS
+///
+/// `connectTls` negotiates with ALPN (default `#("http/1.1")`,
+/// `#verify_none` by default — pass `#verify_peer` with CA options for
+/// real verification). No negotiated protocol (a server without ALPN,
+/// like a default Buccaneer) proceeds as HTTP/1.1; a *different*
+/// negotiated protocol (e.g. `"h2"`) is an error.
+sealed typed Value subclass: MintHTTP1
+  field: socket :: Object | Nil = nil
+  field: transport :: Symbol = #tcp
+  field: host :: String = ""
+  field: port :: Integer = 80
+  field: buffer :: Binary = ""
+  field: timeout :: Integer = 5000
+  field: nextRef :: Integer = 0
+  field: inFlightRef :: Integer | Nil = nil
+  field: inFlightMethod :: String = ""
+
+  // ===== Connect =====
+
+  /// The default `recv`/`connect` timeout in milliseconds.
+  class sealed defaultTimeout -> Integer => 5000
+
+  /// The default ALPN protocols offered on TLS connections.
+  class sealed defaultAlpn -> List(String) => #("http/1.1")
+
+  /// The `#timeout` option: milliseconds, defaulting to
+  /// `defaultTimeout`. Anything else raises.
+  class sealed timeoutOf: opts :: Dictionary(Symbol, Object) -> Integer =>
+    raw := opts at: #timeout ifAbsent: [^self defaultTimeout]
+    (raw isKindOf: Integer) ifFalse: [
+      Error signal: "timeout must be an Integer number of milliseconds"
+    ]
+    raw
+
+  /// The `#verify` option: a Symbol, default `#verify_none`.
+  class sealed verifyOf: opts :: Dictionary(Symbol, Object) -> Symbol =>
+    raw := opts at: #verify ifAbsent: [^#verify_none]
+    (raw isKindOf: Symbol) ifFalse: [Error signal: "verify must be a Symbol"]
+    raw
+
+  /// The `#alpn` option: a List of Strings, default `defaultAlpn`.
+  class sealed alpnOf: opts :: Dictionary(Symbol, Object) -> List(String) =>
+    raw := opts at: #alpn ifAbsent: [^self defaultAlpn]
+    (raw isKindOf: List) ifFalse: [
+      Error signal: "alpn must be a List of Strings"
+    ]
+    raw
+
+  /// The CRLF CRLF bytes ending a response head.
+  class sealed headTerminator -> Binary => Binary fromBytes: #(13, 10, 13, 10)
+
+  /// The CRLF bytes ending a response line.
+  class sealed lineTerminator -> Binary => Binary fromBytes: #(13, 10)
+
+  /// Open a cleartext connection. Answers `Result ok:` with the
+  /// connected value, or `Result error:` with the Erlang reason.
+  class sealed connect: host :: String port: port :: Integer -> Result(MintHTTP1, Object) =>
+    self
+      connect: host
+      port: port
+      options: (Dictionary new)
+
+  /// Open a cleartext connection with options (`#timeout`).
+  class sealed connect: host :: String port: port :: Integer options: opts :: Dictionary(Symbol, Object) -> Result(MintHTTP1, Object) =>
+    timeout := self timeoutOf: opts
+    ip := self resolve: host
+    ip isError ifTrue: [^ip]
+    raw := MintHTTP1
+      bare: ((Erlang gen_tcp)
+        connect: ip value
+        port: port
+        opts: #(#binary, {#packet, #raw}, {#active, false})
+        timeout: timeout)
+    raw isError ifTrue: [^Result error: raw error]
+    Result
+      ok: (MintHTTP1
+        new: #{
+          #socket => raw value,
+          #transport => #tcp,
+          #host => host,
+          #port => port,
+          #buffer => "",
+          #timeout => timeout
+        })
+
+  /// Open a TLS connection with options (`#timeout`, `#verify` default
+  /// `#verify_none`, `#alpn` default `#("http/1.1")`). The ALPN
+  /// negotiation is checked: an unexpected protocol is an error, while
+  /// no negotiation (a server without ALPN) proceeds as HTTP/1.1.
+  class sealed connectTls: host :: String port: port :: Integer options: opts :: Dictionary(Symbol, Object) -> Result(MintHTTP1, Object) =>
+    timeout := self timeoutOf: opts
+    verify := self verifyOf: opts
+    alpn := self alpnOf: opts
+    ip := self resolve: host
+    ip isError ifTrue: [^ip]
+    rawOpts := MintHTTP1 unwrapOptions: #(#binary, {#packet, #raw}, {#active, false}, {#verify, verify}, {#alpn_advertised_protocols, alpn}, {#server_name_indication, host toBytes})
+    raw := MintHTTP1
+      bare: ((Erlang ssl)
+        connect: ip value
+        port: port
+        tlsoptions: rawOpts
+        timeout: timeout)
+    raw isError ifTrue: [^Result error: raw error]
+    sock :: Object := raw value
+    check := self checkAlpn: (MintHTTP1 bare: ((Erlang ssl) negotiated_protocol: sock)) offered: alpn
+    check isError
+      ifTrue: [
+        self closeSocket: sock transport: #tls
+        ^check
+      ]
+    Result
+      ok: (MintHTTP1
+        new: #{
+          #socket => sock,
+          #transport => #tls,
+          #host => host,
+          #port => port,
+          #buffer => "",
+          #timeout => timeout
+        })
+
+  /// Replace an FFI Exception error with its bare Erlang reason
+  /// (Catalina's `TransportResult bare:` rule, ADR 0076): without it,
+  /// reasons stay `RuntimeError` objects that never `=:=` an atom.
+  class sealed bare: result :: Result(V, Exception) -> Result(V, Object) =>
+    result mapError: [:e | e reason]
+
+  /// Resolve a hostname (or IP literal) to an address tuple for
+  /// `gen_tcp`/`ssl`, which only take tuples from Beamtalk (a String
+  /// host reaches them unusable). Answers `Result ok:` with the tuple.
+  class sealed resolve: host :: String -> Result(Tuple, Object) =>
+    MintHTTP1 bare: ((Erlang inet) getaddr: host toBytes with: #inet)
+
+  /// Check an ALPN outcome against the offered protocols. No
+  /// negotiation (`#protocol_not_negotiated`, a server without ALPN)
+  /// proceeds; any other transport error propagates; a negotiated
+  /// protocol outside the offered list is an error.
+  class sealed checkAlpn: neg :: Object offered: offered :: List(String) -> Result(Nil, Object) =>
+    neg isError
+      ifTrue: [
+        neg error =:= #protocol_not_negotiated ifTrue: [
+          ^Result ok: nil
+        ] ifFalse: [^neg]
+      ]
+    proto := neg value
+    (offered anySatisfy: [:each :: String |
+      ((MintHTTP1 unwrap: each) =:= proto) or: [each =:= proto]
+    ]) ifTrue: [^Result ok: nil]
+    Result error: ("unexpected ALPN protocol: " ++ proto printString)
+
+  /// A test-only connection over a preset byte buffer with no socket:
+  /// `stream` parses from the buffer, and reads past its end answer a
+  /// truncation error instead of touching the network.
+  class sealed buffered: bytes :: Binary -> MintHTTP1 =>
+    MintHTTP1 new: #{#buffer => bytes}
+
+  /// Close a raw socket, ignoring errors.
+  class sealed closeSocket: sock :: Object transport: t :: Symbol -> Nil =>
+    t =:= #tls ifTrue: [
+      (Erlang ssl) close: sock
+    ] ifFalse: [(Erlang gen_tcp) close: sock]
+    nil
+
+  /// Unwrap Strings to binaries for the FFI (`gen_tcp`/`ssl` reject
+  /// nested Strings; a whole option tree unwraps to a List). One
+  /// `@expect type` here keeps every call site precisely typed.
+  @expect type
+  class sealed unwrap: bytes :: Object -> Binary =>
+    (Erlang beamtalk_primitive) deep_unwrap_strings: bytes
+
+  /// Unwrap a nested option tree for the FFI.
+  @expect type
+  class sealed unwrapOptions: options :: List(Object) -> List(Object) =>
+    (Erlang beamtalk_primitive) deep_unwrap_strings: options
+
+  /// Parse head bytes into `{version, status, headers}`: `version` is
+  /// `{#http1, major, minor}`. Answers a `Result error:` on malformed
+  /// bytes (never raise on peer input).
+  class sealed parseHead: head :: Binary -> Result(Tuple, Object) =>
+    lines := self splitLines: head
+    lines isEmpty ifTrue: [^Result error: "empty response head"]
+    statusLine := lines at: 1
+    parsed := self parseStatusLine: statusLine
+    parsed isError ifTrue: [^parsed]
+    tail := #()
+    2 to: lines size do: [:i :: Integer | tail := tail ++ #((lines at: i))]
+    headers := self parseHeaders: tail
+    headers isError ifTrue: [^headers]
+    Result ok: {parsed value at: 1, parsed value at: 2, headers value}
+
+  /// Split head bytes on CRLF (the terminator itself is excluded).
+  class sealed splitLines: head :: Binary -> List(Binary) =>
+    out :: List(Binary) := #()
+    rest := head
+    [true]
+      whileTrue: [
+        at := rest indexOf: MintHTTP1 lineTerminator
+        at isNil ifTrue: [^out ++ #(rest)]
+        out := out ++ #((rest part: 0 size: (at - 1)))
+        rest := rest part: (at + 1) size: (rest size - at - 1)
+      ]
+    out
+
+  /// Parse `HTTP/1.1 200 OK` into `{{#http1, major, minor}, status}`.
+  class sealed parseStatusLine: line :: Binary -> Result(Tuple, Object) =>
+    text := line asString
+    text isError ifTrue: [^Result error: "status line is not UTF-8"]
+    parts := text value split: " "
+    parts size < 2 ifTrue: [^Result error: "malformed status line"]
+    version := self parseVersion: (parts at: 1)
+    version isError ifTrue: [^version]
+    code := self parseDecimal: (parts at: 2)
+    code isError ifTrue: [^Result error: "malformed status code"]
+    Result ok: {version value, code value}
+
+  /// Parse `HTTP/1.1` into `{#http1, major, minor}`.
+  class sealed parseVersion: token :: String -> Result(Tuple, Object) =>
+    (token startsWith: "HTTP/") ifFalse: [^Result error: "unsupported version"]
+    dotted := token part: 5 size: (token size - 5)
+    dot := dotted indexOf: "."
+    dot isNil ifTrue: [^Result error: "malformed version"]
+    major := self parseDecimal: (dotted part: 0 size: (dot - 1))
+    minor := self parseDecimal: (dotted part: dot size: (dotted size - dot))
+    (major isError or: [
+      minor isError
+    ]) ifTrue: [^Result error: "malformed version"]
+    supported := (major value =:= 1) and: [
+      (minor value =:= 0) or: [minor value =:= 1]
+    ]
+    supported ifFalse: [^Result error: "unsupported version"]
+    Result ok: {#http1, major value, minor value}
+
+  /// Parse header lines into `{name, value}` pairs: names lowercase,
+  /// values Strings, or opaque Binaries when not valid UTF-8. Empty
+  /// lines are skipped; a line without a colon is malformed.
+  class sealed parseHeaders: lines :: List(Binary) -> Result(List(MintHeader), Object) =>
+    out :: List(MintHeader) := #()
+    lines
+      do: [:line :: Binary |
+        line size =:= 0
+          ifFalse: [
+            parsed := self parseHeader: line
+            parsed isError ifTrue: [^parsed]
+            out := out ++ #(parsed value)
+          ]
+      ]
+    Result ok: out
+
+  /// Parse one `name: value` line.
+  class sealed parseHeader: line :: Binary -> Result(MintHeader, Object) =>
+    at := line indexOf: ":"
+    at isNil ifTrue: [^Result error: "malformed header line"]
+    name := (line part: 0 size: at - 1) asString
+    name isError ifTrue: [^Result error: "header name is not UTF-8"]
+    trimmed := (name value trim) lowercase
+    trimmed size =:= 0 ifTrue: [^Result error: "empty header name"]
+    raw := line part: at size: (line size - at)
+    value := raw asString
+    Result
+      ok: (MintHeader name: trimmed value: (value isError ifTrue: [
+        self stripOws: raw
+      ] ifFalse: [value value trim]))
+
+  /// Strip ASCII spaces and tabs from both ends, byte-wise (for opaque
+  /// non-UTF-8 header values, where `trim` cannot run).
+  class sealed stripOws: bytes :: Binary -> Binary =>
+    start := self owsStart: bytes at: 0
+    stop := self owsEnd: bytes at: bytes size
+    bytes part: start size: stop - start
+
+  /// The first index that is not a space or tab.
+  class sealed owsStart: bytes :: Binary at: i :: Integer -> Integer =>
+    i >= bytes size ifTrue: [^i]
+    byte := bytes byteAt: i
+    ((byte =:= 32) or: [
+      byte =:= 9
+    ]) ifTrue: [self owsStart: bytes at: i + 1] ifFalse: [i]
+
+  /// One past the last index that is not a space or tab.
+  class sealed owsEnd: bytes :: Binary at: n :: Integer -> Integer =>
+    n =:= 0 ifTrue: [^0]
+    byte := bytes byteAt: n - 1
+    ((byte =:= 32) or: [
+      byte =:= 9
+    ]) ifTrue: [self owsEnd: bytes at: n - 1] ifFalse: [n]
+
+  /// Parse a chunk-size line (`1a; ext=1`) into its Integer size.
+  class sealed parseChunkSize: line :: Binary -> Result(Integer, Object) =>
+    text := line asString
+    text isError ifTrue: [^Result error: "chunk size is not UTF-8"]
+    bare := (text value split: ";") at: 1
+    trimmed := bare trim
+    trimmed size =:= 0 ifTrue: [^Result error: "empty chunk size"]
+    trimmed size > 16 ifTrue: [^Result error: "chunk size too long"]
+    self parseHex: trimmed
+
+  /// Parse a non-empty decimal digit string. Anything else is an error.
+  class sealed parseDecimal: text :: String | Binary -> Result(Integer, Object) =>
+    text size =:= 0 ifTrue: [^Result error: "empty integer"]
+    value := 0
+    1
+      to: text size
+      do: [:i :: Integer |
+        byte := (text byteAt: (i - 1))
+        (byte >= 48 and: [
+          byte <= 57
+        ]) ifTrue: [
+          value := value * 10 + byte - 48
+        ] ifFalse: [^Result error: "not a decimal integer"]
+      ]
+    Result ok: value
+
+  /// Parse a non-empty hexadecimal digit string. Anything else errors.
+  class sealed parseHex: text :: String | Binary -> Result(Integer, Object) =>
+    text size =:= 0 ifTrue: [^Result error: "empty integer"]
+    value := 0
+    1
+      to: text size
+      do: [:i :: Integer |
+        byte := (text byteAt: (i - 1))
+        digit := self hexValue: byte
+        digit isNil ifTrue: [
+          ^Result error: "not a hexadecimal integer"
+        ] ifFalse: [value := value * 16 + digit]
+      ]
+    Result ok: value
+
+  /// A hex digit's value, or nil.
+  class sealed hexValue: byte :: Integer -> Integer | Nil =>
+    (byte >= 48 and: [byte <= 57]) ifTrue: [^byte - 48]
+    (byte >= 65 and: [byte <= 70]) ifTrue: [^byte - 55]
+    (byte >= 97 and: [byte <= 102]) ifTrue: [^byte - 87]
+    nil
+
+  /// Whether the connection can take another request.
+  isOpen -> Boolean => self socket isNil not
+
+  /// How many requests are in flight (0 or 1: single-flight).
+  openRequestCount -> Integer => self inFlightRef isNil ifTrue: [0] ifFalse: [1]
+
+  /// Close the socket (best effort) and answer a closed connection.
+  close -> MintHTTP1 =>
+    self socket isNil ifFalse: [
+      self class closeSocket: self socket transport: self transport
+    ]
+    self withSocket: nil
+
+  // ===== Request =====
+
+  /// Send a request head and body. Answers `Result ok:` with
+  /// `{conn, ref}`: the live connection threading the in-flight
+  /// request, and the reference tagging this response's parts in
+  /// `stream`. Only one request may be in flight (`#already_in_flight`
+  /// otherwise); a closed connection answers `#closed`.
+  ///
+  /// - `method` — e.g. `"GET"` (case-insensitive, sent uppercased).
+  /// - `target` — the origin-form path, e.g. `"/get?x=1"`.
+  /// - `headers` — pre-rendered `"name: value"` lines (values already
+  ///   text); `host` and `content-length` are filled in when missing.
+  /// - `body` — a String or Binary (empty sends `content-length: 0`,
+  ///   keeping framing unambiguous).
+  request: method :: String target: target :: String headers: headers :: List(String) body: body :: String | Binary -> Result(Tuple, Object) =>
+    self socket isNil ifTrue: [^Result error: #closed]
+    self inFlightRef isNil ifFalse: [^Result error: #already_in_flight]
+    upper := method uppercase
+    sent := self sendLine: upper ++ " " ++ target ++ " HTTP/1.1"
+    sent isError ifTrue: [^sent]
+    sent := self sendLine: "host: " ++ self hostHeader
+    sent isError ifTrue: [^sent]
+    1
+      to: headers size
+      do: [:i :: Integer |
+        sent := self sendLine: (headers at: i)
+        sent isError ifTrue: [^sent]
+      ]
+    framed := self framesBody: headers
+    framed
+      ifFalse: [
+        wire := MintHTTP1 unwrap: body
+        sent := self sendLine: "content-length: " ++ wire size printString
+        sent isError ifTrue: [^sent]
+      ]
+    sent := self send: (MintHTTP1 unwrap: "\r\n")
+    sent isError ifTrue: [^sent]
+    sent := self send: body
+    sent isError ifTrue: [^sent]
+    ref := self nextRef
+    Result ok: {((self withNextRef: ref + 1) withInFlightRef: ref) withInFlightMethod: upper, ref}
+
+  /// Send one header line (the CRLF is added).
+  sendLine: line :: String -> Result(Nil, Object) =>
+    self send: (MintHTTP1 unwrap: line ++ "\r\n")
+
+  /// Whether the caller already framed the body: any line starting
+  /// (case-insensitively) with `content-length:` or
+  /// `transfer-encoding:`.
+  framesBody: headers :: List(String) -> Boolean =>
+    framed := false
+    1
+      to: headers size
+      do: [:i :: Integer |
+        line :: Object := headers at: i
+        lower := line lowercase
+        ((lower startsWith: "content-length:") =:= true) ifTrue: [
+          framed := true
+        ]
+        ((lower startsWith: "transfer-encoding:") =:= true) ifTrue: [
+          framed := true
+        ]
+      ]
+    framed
+
+  /// The `host` header value: the host, plus the port when non-default.
+  hostHeader -> String =>
+    default := self transport =:= #tls ifTrue: [443] ifFalse: [80]
+    self port =:= default ifTrue: [
+      ^self host
+    ] ifFalse: [^self host ++ ":" ++ self port printString]
+
+  /// Send bytes on this connection's socket.
+  send: bytes :: Object -> Result(Nil, Object) =>
+    wire := MintHTTP1 unwrap: bytes
+    MintHTTP1
+      bare: (self transport =:= #tls ifTrue: [
+        (Erlang ssl) send: self socket with: wire
+      ] ifFalse: [(Erlang gen_tcp) send: self socket with: wire])
+
+  // ===== Stream =====
+
+  /// Read this reference's full response. Answers `Result ok:` with
+  /// `{conn, parts}`: the connection (closed when the response demands
+  /// it, buffering any bytes past the body for the next request) and
+  /// the Mint parts — `{#status, ref, code}`,
+  /// `{#headers, ref, headers}`, zero or more `{#data, ref, bytes}`,
+  /// and `{#done, ref}`. Header names are lowercase Strings; values
+  /// are Strings, or opaque Binaries when not valid UTF-8. An unknown
+  /// reference answers `#unknown_ref`.
+  stream: ref :: Integer timeout: ms :: Integer -> Result(Tuple, Object) =>
+    self inFlightRef =:= ref ifFalse: [^Result error: #unknown_ref]
+    head := self readHead: ms
+    head isError ifTrue: [^head]
+    conn := head value at: 1
+    version := head value at: 2
+    status := head value at: 3
+    headers := head value at: 4
+    body := conn
+      readBody: status
+      headers: headers
+      ms: ms
+    body isError ifTrue: [^body]
+    conn2 := body value at: 1
+    bytes := body value at: 2
+    parts :: List(Tuple) := #({#status, ref, status}, {#headers, ref, headers})
+    bytes size > 0 ifTrue: [parts := parts ++ #({#data, ref, bytes})]
+    parts := parts ++ #({#done, ref})
+    idle := (conn2 withInFlightRef: nil) withInFlightMethod: ""
+    Result ok: {(idle withClosedWhen: version headers: headers), parts}
+
+  /// Receive available bytes (length 0: whatever has arrived).
+  recv: ms :: Integer -> Result(Binary, Object) =>
+    sock := self socket
+    sock isNil ifTrue: [^Result error: #no_socket_data]
+    raw := MintHTTP1
+      bare: (self transport =:= #tls
+        ifTrue: [
+          (Erlang ssl)
+            recv: sock
+            with: 0
+            with: ms
+        ]
+        ifFalse: [
+          (Erlang gen_tcp)
+            recv: sock
+            with: 0
+            with: ms
+        ])
+    raw isError ifTrue: [^Result error: raw error]
+    Result ok: raw value
+
+  /// Read through the response head, skipping `1xx` interim responses.
+  /// Answers `Result ok:` with `{conn, version, status, headers}`.
+  readHead: ms :: Integer -> Result(Tuple, Object) =>
+    found := self buffer indexOf: MintHTTP1 headTerminator
+    found isNil
+      ifTrue: [
+        chunk := self recv: ms
+        chunk isError ifTrue: [^chunk]
+        ^(self withBuffer: (self buffer concat: chunk value)) readHead: ms
+      ]
+    head := self buffer part: 0 size: (found - 1)
+    rest := self buffer part: (found + 3) size: (self buffer size - found - 3)
+    parsed := MintHTTP1 parseHead: head
+    parsed isError ifTrue: [^parsed]
+    version := parsed value at: 1
+    status := parsed value at: 2
+    headers := parsed value at: 3
+    conn := self withBuffer: rest
+    (status >= 100 and: [status < 200]) ifTrue: [^conn readHead: ms]
+    status =:= 101 ifTrue: [
+      ^Result error: "101 switching protocols unsupported"
+    ]
+    Result ok: {conn, version, status, headers}
+
+  // ===== Body framing =====
+
+  /// Read the response body per the request method, status and headers.
+  /// Answers `Result ok:` with `{conn, body}`.
+  readBody: status :: Integer headers: headers :: List(MintHeader) ms: ms :: Integer -> Result(Tuple, Object) =>
+    noBody := (self inFlightMethod =:= "HEAD") or: [
+      (status =:= 204 or: [
+        status =:= 304
+      ]) or: [status >= 100 and: [status < 200]]
+    ]
+    noBody ifTrue: [^Result ok: {self, (Binary fromBytes: #())}]
+    (self
+      headerToken: headers
+      name: "transfer-encoding"
+      token: "chunked") ifTrue: [
+      ^self readChunked: (Binary fromBytes: #()) ms: ms
+    ]
+    length := self contentLength: headers
+    length isError ifTrue: [^length]
+    length value match: [
+      n :: Integer -> self readExactly: n ms: ms;
+      _ -> self readUntilClose: self buffer ms: ms
+    ]
+
+  /// The first header value for a name (case-insensitive: names parse
+  /// lowercase), or nil. Values are Strings or opaque Binaries.
+  headerValueOf: headers :: List(MintHeader) name: want :: String -> Object =>
+    headers do: [:h :: MintHeader | h name =:= want ifTrue: [^h value]]
+    nil
+
+  /// Whether a comma-separated header lists a token (case-insensitive
+  /// on Strings; an opaque Binary value never matches an ASCII token).
+  headerToken: headers :: List(MintHeader) name: want :: String token: token :: String -> Boolean =>
+    value := self headerValueOf: headers name: want
+    value isNil ifTrue: [^false]
+    (value isKindOf: String) ifFalse: [^false]
+    parts := value split: ","
+    parts do: [:each :: String |
+      (each trim lowercase =:= token) ifTrue: [^true]
+    ]
+    false
+
+  /// The `content-length` value as an Integer, nil when absent.
+  /// Multiple values must agree (RFC 9112 section 6.3); a non-decimal
+  /// value is malformed (a bare Integer parse would wrongly accept
+  /// `+10` or `-0`, per Bandit's rule).
+  contentLength: headers :: List(MintHeader) -> Result(Object, Object) =>
+    found := nil
+    headers
+      do: [:h :: MintHeader |
+        h name =:= "content-length"
+          ifTrue: [
+            parsed := MintHTTP1 parseDecimal: (self headerText: h value)
+            parsed isError ifTrue: [^parsed]
+            found isNil
+              ifTrue: [found := parsed value]
+              ifFalse: [
+                found =:= parsed value ifFalse: [
+                  ^Result error: "conflicting content-length values"
+                ]
+              ]
+          ]
+      ]
+    Result ok: found
+
+  /// A header value as text for parsing: Strings as they are, opaque
+  /// bytes read unchecked (ASCII digits compare equal either way).
+  headerText: value :: Object -> String =>
+    value match: [
+      s :: String -> s;
+      b :: Binary -> b asStringUnchecked;
+      _ -> ""
+    ]
+
+  /// Read exactly `n` body bytes, pumping `recv` as needed. Answers
+  /// `Result ok:` with `{conn, body}`; short buffered data (a test-only
+  /// connection past its end) answers a truncation error.
+  readExactly: n :: Integer ms: ms :: Integer -> Result(Tuple, Object) =>
+    have := self buffer size
+    have >= n
+      ifTrue: [
+        ^Result ok: {self withBuffer: (self buffer part: n size: (have - n)), self buffer part: 0 size: n}
+      ]
+    chunk := self recv: ms
+    chunk isError ifTrue: [^chunk]
+    (self withBuffer: (self buffer concat: chunk value)) readExactly: n ms: ms
+
+  /// Read chunked transfer coding, answering `{conn, body}`. Oversized
+  /// chunk lines (past 128 bytes) are rejected; extensions past `;`
+  /// are ignored; trailers past the zero chunk are consumed.
+  readChunked: body :: Binary ms: ms :: Integer -> Result(Tuple, Object) =>
+    line := self readLine: ms
+    line isError ifTrue: [^line]
+    conn := line value at: 1
+    size := MintHTTP1 parseChunkSize: (line value at: 2)
+    size isError ifTrue: [^size]
+    size value =:= 0 ifTrue: [^conn readTrailers: ms body: body]
+    data := conn readExactly: size value ms: ms
+    data isError ifTrue: [^data]
+    tail := (data value at: 1) readExactly: 2 ms: ms
+    tail isError ifTrue: [^tail]
+    crlf := tail value at: 2
+    (crlf =:= MintHTTP1 lineTerminator) ifFalse: [
+      ^Result error: "malformed chunked body"
+    ]
+    (tail value at: 1) readChunked: (body concat: (data value at: 2)) ms: ms
+
+  /// Read one CRLF-terminated line (without the CRLF), pumping `recv`
+  /// as needed. Answers `Result ok:` with `{conn, line}`.
+  readLine: ms :: Integer -> Result(Tuple, Object) =>
+    found := self buffer indexOf: MintHTTP1 lineTerminator
+    found isNil
+      ifTrue: [
+        chunk := self recv: ms
+        chunk isError ifTrue: [^chunk]
+        ^(self withBuffer: (self buffer concat: chunk value)) readLine: ms
+      ]
+    found > 129 ifTrue: [^Result error: "line too long"]
+    Result ok: {self withBuffer: (self buffer part: (found + 1) size: (self buffer size - found - 1)), self buffer part: 0 size: (found - 1)}
+
+  /// Consume trailer lines through the empty line, discarding them.
+  readTrailers: ms :: Integer body: body :: Binary -> Result(Tuple, Object) =>
+    line := self readLine: ms
+    line isError ifTrue: [^line]
+    rest := line value at: 2
+    rest size =:= 0 ifTrue: [
+      ^Result ok: {line value at: 1, body}
+    ] ifFalse: [^(line value at: 1) readTrailers: ms body: body]
+
+  /// Read until the server closes: the close-delimited framing for
+  /// responses without length or encoding. `#closed` ends the body;
+  /// any other transport error propagates.
+  readUntilClose: body :: Binary ms: ms :: Integer -> Result(Tuple, Object) =>
+    chunk := self recv: ms
+    chunk isError
+      ifTrue: [
+        chunk error =:= #closed ifTrue: [
+          ^Result ok: {self close, body}
+        ] ifFalse: [^chunk]
+      ]
+    (self withBuffer: (Binary fromBytes: #())) readUntilClose: (body concat: chunk value) ms: ms
+
+  /// Close the connection when the response demands it: `connection:
+  /// close`, or HTTP/1.0 without `connection: keep-alive`.
+  withClosedWhen: version :: Tuple headers: headers :: List(MintHeader) -> MintHTTP1 =>
+    closing := self
+      headerToken: headers
+      name: "connection"
+      token: "close"
+    closing
+      ifFalse: [
+        major := version at: 2
+        minor := version at: 3
+        (major =:= 1 and: [minor =:= 0])
+          ifTrue: [
+            closing := (self
+              headerToken: headers
+              name: "connection"
+              token: "keep-alive") not
+          ]
+      ]
+    closing ifFalse: [^self]
+    self close

@@ -1,0 +1,170 @@
+// Copyright 2026 mint authors
+// SPDX-License-Identifier: Apache-2.0
+
+/// Hermetic `MintHTTP1` tests over preset byte buffers (no socket):
+/// chunked bodies, keep-alive pipelining, HEAD/204 framing, `1xx`
+/// skipping, malformed input, truncation, the ALPN check, and the
+/// request-side guards. An in-flight request is faked with the
+/// `withInFlightRef:`/`withInFlightMethod:` copies.
+TestCase subclass: MintParseTest
+
+  connFor: bytes method: method ref: ref =>
+    ((MintHTTP1 buffered: (MintHTTP1 unwrap: bytes)) withInFlightRef: ref) withInFlightMethod: method
+
+  stream: bytes method: method ref: ref =>
+    (self
+      connFor: bytes
+      method: method
+      ref: ref) stream: ref timeout: 1000
+
+  testChunkedBodyWithExtensionAndTrailer =>
+    raw := "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n4; ext=1\r\nWiki\r\n5\r\npedia\r\n0\r\nx-t: v\r\n\r\nTAIL"
+    {done, parts} := (self
+      stream: raw
+      method: "GET"
+      ref: 0) unwrap
+    self assert: parts size equals: 4
+    self assert: (parts at: 1) equals: {#status, 0, 200}
+    self assert: ((parts at: 3) at: 1) equals: #data
+    self assert: (((parts at: 3) at: 3) asString) unwrap equals: "Wikipedia"
+    self assert: (parts at: 4) equals: {#done, 0}
+    self assert: (done buffer asString) unwrap equals: "TAIL"
+
+  testChunkedCaseInsensitiveHex =>
+    raw := "HTTP/1.1 200 OK\r\ntransfer-encoding: Chunked\r\n\r\nA\r\n0123456789\r\n0\r\n\r\n"
+    {_ignored, parts} := (self
+      stream: raw
+      method: "GET"
+      ref: 1) unwrap
+    self assert: (((parts at: 3) at: 3) asString) unwrap equals: "0123456789"
+
+  testKeepAlivePipelinedResponses =>
+    raw := "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nhiHTTP/1.1 200 OK\r\ncontent-length: 3\r\n\r\nyo!"
+    {done, parts} := (self
+      stream: raw
+      method: "GET"
+      ref: 0) unwrap
+    self assert: (((parts at: 3) at: 3) asString) unwrap equals: "hi"
+    self assert: (done buffer asString) unwrap equals: "HTTP/1.1 200 OK\r\ncontent-length: 3\r\n\r\nyo!"
+    next := (done withInFlightRef: 1) withInFlightMethod: "GET"
+    {done2, parts2} := (next stream: 1 timeout: 1000) unwrap
+    self assert: (((parts2 at: 3) at: 3) asString) unwrap equals: "yo!"
+    self assert: done2 buffer size equals: 0
+
+  testHeadSkipsBody =>
+    raw := "HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nhello"
+    {done, parts} := (self
+      stream: raw
+      method: "HEAD"
+      ref: 0) unwrap
+    self assert: parts size equals: 3
+    self assert: (parts at: 3) equals: {#done, 0}
+    self assert: (done buffer asString) unwrap equals: "hello"
+
+  test204SkipsBody =>
+    raw := "HTTP/1.1 204 No Content\r\nx-a: b\r\n\r\nTAIL"
+    {_ignored, parts} := (self
+      stream: raw
+      method: "GET"
+      ref: 0) unwrap
+    self assert: parts size equals: 3
+    self assert: ((parts at: 2) at: 1) equals: #headers
+
+  testSkipsInterim1xx =>
+    raw := "HTTP/1.1 103 Early Hints\r\nlink: </s>\r\n\r\nHTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nhi"
+    {_ignored, parts} := (self
+      stream: raw
+      method: "GET"
+      ref: 0) unwrap
+    self assert: ((parts at: 1) at: 3) equals: 200
+    self assert: (((parts at: 3) at: 3) asString) unwrap equals: "hi"
+
+  testHeaderNamesLowercasedValuesKept =>
+    raw := "HTTP/1.1 200 OK\r\nX-Custom: VaL\r\ncontent-length: 0\r\n\r\n"
+    {_ignored, parts} := (self
+      stream: raw
+      method: "GET"
+      ref: 0) unwrap
+    headers := ((parts at: 2) at: 3)
+    self assert: (headers at: 1) name equals: "x-custom"
+    self assert: (headers at: 1) value equals: "VaL"
+
+  testOpaqueBinaryHeaderValue =>
+    raw := (MintHTTP1 unwrap: "HTTP/1.1 200 OK\r\nx-bin: ") concat: ((Binary fromBytes: #(255, 254)) concat: (MintHTTP1 unwrap: "\r\ncontent-length: 0\r\n\r\n"))
+    {_ignored, parts} := (self
+      stream: raw
+      method: "GET"
+      ref: 0) unwrap
+    headers := ((parts at: 2) at: 3)
+    self assert: (headers at: 1) value equals: (Binary fromBytes: #(255, 254))
+
+  testMalformedStatusLineIsError =>
+    result := self
+      stream: "NOTHTTP\r\n\r\n"
+      method: "GET"
+      ref: 0
+    self deny: result isOk
+
+  testUnsupportedVersionIsError =>
+    result := self
+      stream: "HTTP/9.9 200 OK\r\n\r\n"
+      method: "GET"
+      ref: 0
+    self deny: result isOk
+
+  testMalformedChunkSizeIsError =>
+    result := self
+      stream: "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\nZZZ\r\n"
+      method: "GET"
+      ref: 0
+    self deny: result isOk
+
+  testConflictingContentLengthIsError =>
+    raw := "HTTP/1.1 200 OK\r\ncontent-length: 3\r\ncontent-length: 4\r\n\r\nabc"
+    result := self
+      stream: raw
+      method: "GET"
+      ref: 0
+    self deny: result isOk
+
+  testTruncatedBodyIsError =>
+    result := self
+      stream: "HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\nabc"
+      method: "GET"
+      ref: 0
+    self deny: result isOk
+
+  testRequestOnClosedConnIsError =>
+    conn := MintHTTP1 buffered: (MintHTTP1 unwrap: "")
+    result := conn
+      request: "GET"
+      target: "/"
+      headers: #()
+      body: ""
+    self deny: result isOk
+
+  testUnknownRefIsError =>
+    conn := self
+      connFor: "HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n"
+      method: "GET"
+      ref: 0
+    result := conn stream: 999 timeout: 1000
+    self deny: result isOk
+
+  testAlreadyInFlight =>
+    conn := ((MintHTTP1 buffered: (MintHTTP1 unwrap: "")) withInFlightRef: 3) withInFlightMethod: "GET"
+    self assert: conn openRequestCount equals: 1
+
+  testAlpnMatchProceeds =>
+    self assert: (MintHTTP1 checkAlpn: (Result ok: "http/1.1") offered: #("http/1.1", "h2")) isOk
+
+  testAlpnAbsentProceeds =>
+    self assert: (MintHTTP1 checkAlpn: (Result error: #protocol_not_negotiated) offered: #("http/1.1")) isOk
+
+  testAlpnMismatchIsError =>
+    result := MintHTTP1 checkAlpn: (Result ok: "h2") offered: #("http/1.1")
+    self deny: result isOk
+
+  testAlpnTransportErrorPropagates =>
+    result := MintHTTP1 checkAlpn: (Result error: #closed) offered: #("http/1.1")
+    self deny: result isOk

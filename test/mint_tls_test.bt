@@ -1,0 +1,88 @@
+// Copyright 2026 mint authors
+// SPDX-License-Identifier: Apache-2.0
+
+/// `MintHTTP1` TLS tests against a local Buccaneer HTTPS server:
+/// the default (ALPN-less) server proceeds as HTTP/1.1, an explicit
+/// `http/1.1` ALPN offer negotiates, and offering only `h2` against
+/// an HTTP/1.1-only server fails the connect.
+TestCase subclass: MintTlsTest
+  field: srv = nil
+  field: srvAlpn = nil
+  field: port = 0
+
+  certfile -> String => "test/fixtures/cert.pem"
+
+  keyfile -> String => "test/fixtures/key.pem"
+
+  startServer: extra =>
+    (Buccaneer
+      start: (#{
+        #port => 0,
+        #scheme => #https,
+        #startupLog => false,
+        #certfile => self certfile,
+        #keyfile => self keyfile,
+        #handler => [:ex |
+          ex
+            sendResp: 200
+            headers: #()
+            body: "tls-hi"
+        ]
+      } merge: extra)) unwrap
+
+  setUp =>
+    self.srv := self startServer: #{}
+    self.port := (self.srv listenerInfo unwrap) at: 2
+    self
+
+  tearDown =>
+    self.srv isNil ifFalse: [self.srv stop: 5000]
+    self.srvAlpn isNil ifFalse: [self.srvAlpn stop: 5000]
+
+  alpnPort =>
+    self.srvAlpn := self
+      startServer: #{
+        #catalina => #{
+          #transportOptions => #{#alpn_preferred_protocols => #("http/1.1")}
+        }
+      }
+    (self.srvAlpn listenerInfo unwrap) at: 2
+
+  testTlsGetRoundTrip =>
+    conn := (MintHTTP1
+      connectTls: "127.0.0.1"
+      port: self.port
+      options: #{}) unwrap
+    {live, ref} := (conn
+      request: "GET"
+      target: "/tls"
+      headers: #()
+      body: "") unwrap
+    {done, parts} := (live stream: ref timeout: 5000) unwrap
+    self assert: ((parts at: 1) at: 3) equals: 200
+    self assert: (((parts at: 3) at: 3) asString) unwrap equals: "tls-hi"
+    self assert: done isOpen
+    done close
+    self assert: parts size equals: 4
+
+  testTlsAlpnNegotiated =>
+    conn := (MintHTTP1
+      connectTls: "127.0.0.1"
+      port: self alpnPort
+      options: #{}) unwrap
+    {live, ref} := (conn
+      request: "GET"
+      target: "/tls"
+      headers: #()
+      body: "") unwrap
+    {_ignored, parts} := (live stream: ref timeout: 5000) unwrap
+    self assert: ((parts at: 1) at: 3) equals: 200
+    live close
+    self assert: parts size equals: 4
+
+  testTlsAlpnMismatchIsError =>
+    result := MintHTTP1
+      connectTls: "127.0.0.1"
+      port: self alpnPort
+      options: #{#alpn => #("h2")}
+    self deny: result isOk
