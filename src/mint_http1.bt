@@ -258,44 +258,12 @@ sealed typed Value subclass: MintHTTP1
     rest := head
     [true]
       whileTrue: [
-        at := self indexOf: MintHTTP1 lineTerminator in: rest
+        at := rest indexOf: MintHTTP1 lineTerminator
         at isNil ifTrue: [^out ++ #(rest)]
         out := out ++ #((rest part: 0 size: (at - 1)))
         rest := rest part: (at + 1) size: ((rest bitSize div: 8) - at - 1)
       ]
     out
-
-  /// The 1-based byte offset of `needle` in `hay`, or nil for an
-  /// empty needle or no match. (A byte under 128 never appears inside
-  /// a multi-byte UTF-8 sequence, so ASCII delimiters are byte-safe.)
-  /// Byte counts via `bitSize div: 8`, never `size`: `size`
-  /// counts characters, so real CRLF CRLF bytes report 2, which
-  /// truncates the scan. (`bitSize` answers bits per ADR 0141.)
-  /// The needle normalizes to a raw Binary first: on toolchains
-  /// with tagged Strings, a String never `=:=` a Binary slice.
-  class sealed indexOf: needle :: String | Binary in: hay :: Binary -> Integer | Nil =>
-    raw :: Binary := (needle isKindOf: String) ifTrue: [
-      Binary fromIolist: needle
-    ] ifFalse: [needle]
-    (raw bitSize div: 8) =:= 0 ifTrue: [^nil]
-    last := (hay bitSize div: 8) - (raw bitSize div: 8)
-    last < 0 ifTrue: [^nil]
-    self
-      indexOf: raw
-      in: hay
-      from: 0
-      to: last
-
-  /// The scan behind `indexOf:in:` (recursion keeps every step in
-  /// plain method frames).
-  class sealed indexOf: needle :: Binary in: hay :: Binary from: i :: Integer to: last :: Integer -> Integer | Nil =>
-    i > last ifTrue: [^nil]
-    ((hay part: i size: (needle bitSize div: 8)) =:= needle) ifTrue: [^(i + 1)]
-    self
-      indexOf: needle
-      in: hay
-      from: (i + 1)
-      to: last
 
   /// Binary as text: valid UTF-8 answers the String, anything else
   /// passes through as opaque Binary. Written era-proof across the
@@ -356,7 +324,7 @@ sealed typed Value subclass: MintHTTP1
 
   /// Parse one `name: value` line.
   class sealed parseHeader: line :: Binary -> Result(MintHeader, Object) =>
-    at := self indexOf: ":" in: line
+    at := line indexOf: (Binary fromIolist: ":")
     at isNil ifTrue: [^Result error: "malformed header line"]
     nameText := self stringOrOpaque: (line part: 0 size: at - 1)
     (nameText isKindOf: String) ifFalse: [
@@ -504,20 +472,12 @@ sealed typed Value subclass: MintHTTP1
   /// (case-insensitively) with `content-length:` or
   /// `transfer-encoding:`.
   framesBody: headers :: List(String) -> Boolean =>
-    framed := false
-    1
-      to: headers size
-      do: [:i |
-        line := headers at: i
-        lower := line lowercase
-        ((lower startsWith: "content-length:") =:= true) ifTrue: [
-          framed := true
-        ]
-        ((lower startsWith: "transfer-encoding:") =:= true) ifTrue: [
-          framed := true
+    headers
+      anySatisfy: [:line |
+        (line lowercase startsWith: "content-length:") or: [
+          line lowercase startsWith: "transfer-encoding:"
         ]
       ]
-    framed
 
   /// The `host` header value: the host, plus the port when non-default.
   hostHeader -> String =>
@@ -576,7 +536,7 @@ sealed typed Value subclass: MintHTTP1
   /// Read through the response head, skipping `1xx` interim responses.
   /// Answers `Result ok:` with `{conn, version, status, headers}`.
   readHead: ms :: Integer -> Result(Tuple, Object) =>
-    found := MintHTTP1 indexOf: MintHTTP1 headTerminator in: self buffer
+    found := self buffer indexOf: MintHTTP1 headTerminator
     found isNil
       ifTrue: [
         chunk := self recv: ms
@@ -634,8 +594,7 @@ sealed typed Value subclass: MintHTTP1
     value isNil ifTrue: [^false]
     (value isKindOf: String) ifFalse: [^false]
     parts := value split: ","
-    parts do: [:each | (each trim lowercase =:= token) ifTrue: [^true]]
-    false
+    parts anySatisfy: [:each | each trim lowercase =:= token]
 
   /// The `content-length` value as an Integer, nil when absent.
   /// Multiple values must agree (RFC 9112 section 6.3); a non-decimal
@@ -703,7 +662,7 @@ sealed typed Value subclass: MintHTTP1
   /// Read one CRLF-terminated line (without the CRLF), pumping `recv`
   /// as needed. Answers `Result ok:` with `{conn, line}`.
   readLine: ms :: Integer -> Result(Tuple, Object) =>
-    found := MintHTTP1 indexOf: MintHTTP1 lineTerminator in: self buffer
+    found := self buffer indexOf: MintHTTP1 lineTerminator
     found isNil
       ifTrue: [
         chunk := self recv: ms

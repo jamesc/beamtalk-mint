@@ -147,7 +147,7 @@ Actor subclass: MintTestServer
   /// Pump `recv` until the head terminator arrives, answering the
   /// head bytes (extra bytes stay buffered for the next request).
   takeHeadLoop: sock buf: buf :: Binary -> Result(Binary, Object) =>
-    at := MintHTTP1 indexOf: MintHTTP1 headTerminator in: buf
+    at := buf indexOf: MintHTTP1 headTerminator
     at isNil
       ifFalse: [
         self.rest := buf part: (at + 3) size: ((buf bitSize div: 8) - at - 3)
@@ -177,17 +177,17 @@ Actor subclass: MintTestServer
 
   /// Split head bytes on CRLF.
   splitHead: head :: Binary -> List(Binary) =>
-    at := MintHTTP1 indexOf: MintHTTP1 lineTerminator in: head
+    at := head indexOf: MintHTTP1 lineTerminator
     at isNil ifTrue: [^#(head)]
     #((head part: 0 size: (at - 1)))
       ++ (self splitHead: (head part: (at + 1) size: ((head bitSize div: 8) - at - 1)))
 
   /// The target of a `METHOD SP TARGET SP VERSION` line.
   requestTarget: line :: Binary -> String =>
-    first := MintHTTP1 indexOf: " " in: line
+    first := line indexOf: (Binary fromIolist: " ")
     first isNil ifTrue: [^line asStringUnchecked]
     tail := line part: first size: ((line bitSize div: 8) - first)
-    second := MintHTTP1 indexOf: " " in: tail
+    second := tail indexOf: (Binary fromIolist: " ")
     second isNil ifTrue: [^line asStringUnchecked]
     (tail part: 0 size: (second - 1)) asStringUnchecked
 
@@ -213,7 +213,7 @@ Actor subclass: MintTestServer
   /// Parse one `name: value` line (names lowercase; values raw bytes,
   /// OWS-stripped, for exact echoes).
   parseReqHeader: line :: Binary -> Result(MintHeader, Object) =>
-    at := MintHTTP1 indexOf: ":" in: line
+    at := line indexOf: (Binary fromIolist: ":")
     at isNil ifTrue: [^Result error: "malformed header line"]
     nameText := MintHTTP1 stringOrOpaque: (line part: 0 size: at - 1)
     (nameText isKindOf: String) ifFalse: [
