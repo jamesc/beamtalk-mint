@@ -1,8 +1,13 @@
 // Copyright 2026 mint authors
 // SPDX-License-Identifier: Apache-2.0
 
+/// UTF-8 text as a String, or opaque bytes as a Binary when the
+/// bytes are not valid UTF-8. A String never `=:=` a Binary slice,
+/// so non-UTF-8 bytes stay binary rather than decoding lossy.
+type TextOrBytes = String | Binary
+
 /// Mint — main class for the mint library.
 Object subclass: Mint
 
   /// Return a greeting string.
-  class greet => "Hello from mint!"
+  class greet -> String => "Hello from mint!"
