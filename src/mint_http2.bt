@@ -1,0 +1,765 @@
+// Copyright 2026 mint authors
+// SPDX-License-Identifier: Apache-2.0
+
+/// MintHTTP2 — a processless HTTP/2 client connection, a port of
+/// `Mint.HTTP2` (BT-4529) over the published `hpack` package.
+///
+/// Like `MintHTTP1`, the connection is a `Value`: every operation threads
+/// it through and answers an updated copy. There is no process and no
+/// socket ownership transfer — the socket stays passive and `stream`
+/// blocks in `recv` until the wanted response completes.
+///
+/// ## Usage
+///
+/// ```beamtalk
+/// conn := (MintHTTP2 connect: "127.0.0.1" port: 8080) unwrap.
+/// {live, ref} := (conn request: "GET" target: "/" headers: #() body: "") unwrap.
+/// {done, parts} := (live stream: ref timeout: 5000) unwrap.
+/// // parts: {#status, ref, 200}, {#headers, ref, headers},
+/// //        {#data, ref, bytes}, {#done, ref}
+/// done close.
+/// ```
+///
+/// ## Handshake
+///
+/// `connect:` speaks prior-knowledge cleartext (`h2c`): it sends the
+/// connection preface and an empty `SETTINGS`, then reads the server's
+/// `SETTINGS` and acknowledges it. `connectTls:` negotiates `h2` over
+/// ALPN first (a missing or different protocol is an error — unlike
+/// HTTP/1.1, there is no fallback), then runs the same handshake.
+///
+/// ## Multiplexing
+///
+/// Any number of requests may be in flight: each answers its stream id
+/// as the reference, and `stream:ref` reads frames until *that* stream's
+/// response completes, buffering other streams' progress in the
+/// connection. Responses arrive as Mint parts — `{#status, ref, code}`,
+/// `{#headers, ref, headers}`, zero or more `{#data, ref, bytes}` and
+/// `{#done, ref}` — with header values as Strings, or opaque Binaries
+/// when not valid UTF-8 (the `MintHeader` convention).
+///
+/// ## Flow control
+///
+/// Connection and per-stream send windows start at 65535 (or the
+/// server's `initial_window_size`) and shrink as DATA goes out; request
+/// bodies that do not fit wait as `#pending` and go out as
+/// `WINDOW_UPDATE`s arrive. Receive windows shrink as DATA arrives and
+/// are replenished with `WINDOW_UPDATE`s once half-consumed, so a slow
+/// reader never stalls the peer forever. A peer `SETTINGS` frame is
+/// applied (`initial_window_size` re-scales open streams,
+/// `header_table_size` resizes the HPACK encoder, `max_frame_size`
+/// caps sends, `max_concurrent_streams` caps new requests); `PING`s are
+/// acknowledged, `GOAWAY` stops new requests, and `RST_STREAM` on the
+/// streamed reference answers `{#reset, code}`.
+///
+/// ## Errors
+///
+/// `stream:` answers `Result error:` with the frame-codec message (or
+/// `{#reset, code}`) when the connection dies: a `GOAWAY` goes out best
+/// effort and the socket closes. An unknown reference answers
+/// `#unknown_ref`; a closed connection answers `#closed`.
+sealed typed Value subclass: MintHTTP2
+  field: socket :: MintSocket | Nil = nil
+  field: transport :: Symbol = #tcp
+  field: host :: String = ""
+  field: port :: Integer = 80
+  field: buffer :: Binary = ""
+  field: timeout :: Integer = 5000
+  field: nextId :: Integer = 1
+  field: streams :: Dictionary(Integer, Object) = #{}
+  field: connSendWindow :: Integer = 65535
+  field: connRecvWindow :: Integer = 65535
+  field: peerMaxFrame :: Integer = 16384
+  field: peerInitWindow :: Integer = 65535
+  field: peerMaxStreams :: Integer | Nil = nil
+  field: encodeTable :: HPACKTable | Nil = nil
+  field: decodeTable :: HPACKTable | Nil = nil
+  field: goawayLastId :: Integer | Nil = nil
+
+  // ===== Connect =====
+
+  /// The default `recv`/`connect` timeout in milliseconds.
+  class sealed defaultTimeout -> Integer => 5000
+
+  /// The ALPN protocol negotiated on TLS connections.
+  class sealed alpnProtocol -> Binary => Binary fromIolist: "h2"
+
+  /// Open a prior-knowledge cleartext (`h2c`) connection. Answers
+  /// `Result ok:` with the handshaked connection.
+  class sealed connect: host :: String port: port :: Integer -> Result(MintHTTP2, Object) =>
+    self
+      connect: host
+      port: port
+      options: (Dictionary new)
+
+  /// Open a prior-knowledge cleartext connection with options
+  /// (`#timeout` in milliseconds).
+  class sealed connect: host :: String port: port :: Integer options: opts :: Dictionary(Symbol, Object) -> Result(MintHTTP2, Object) =>
+    timeout := MintHTTP1 timeoutOf: opts
+    ip := MintHTTP1 resolve: host
+    ip isError ifTrue: [^ip]
+    sock := MintTcpSocket
+      connect: ip value
+      port: port
+      opts: #(#binary, {#packet, #raw}, {#active, false})
+      timeout: timeout
+    sock isError ifTrue: [^sock]
+    (MintHTTP2
+      socket: sock value
+      transport: #tcp
+      host: host
+      port: port
+      buffer: ""
+      timeout: timeout
+      nextId: 1
+      streams: #{}
+      connSendWindow: MintH2Frame defaultWindow
+      connRecvWindow: MintH2Frame defaultWindow
+      peerMaxFrame: MintH2Frame defaultMaxFrame
+      peerInitWindow: MintH2Frame defaultWindow
+      peerMaxStreams: nil
+      encodeTable: (HPACK newTable: 4096)
+      decodeTable: (HPACK newTable: 4096)
+      goawayLastId: nil) open: timeout
+
+  /// Open a TLS connection negotiating `h2` over ALPN (`#verify`
+  /// default `#verify_none`, `#timeout` in milliseconds). A missing or
+  /// different negotiated protocol is an error.
+  class sealed connectTls: host :: String port: port :: Integer options: opts :: Dictionary(Symbol, Object) -> Result(MintHTTP2, Object) =>
+    timeout := MintHTTP1 timeoutOf: opts
+    verify := MintHTTP1 verifyOf: opts
+    ip := MintHTTP1 resolve: host
+    ip isError ifTrue: [^ip]
+    sni := MintHTTP1 sniOf: host
+    rawOpts := sni isNil
+      ifTrue: [
+        #(#binary, {#packet, #raw}, {#active, false}, {#verify, verify}, {#alpn_advertised_protocols, #(MintHTTP2 alpnProtocol)})
+      ]
+      ifFalse: [
+        #(#binary, {#packet, #raw}, {#active, false}, {#verify, verify}, {#alpn_advertised_protocols, #(MintHTTP2 alpnProtocol)}, {#server_name_indication, sni})
+      ]
+    sock := MintTlsSocket
+      connect: ip value
+      port: port
+      opts: rawOpts
+      timeout: timeout
+    sock isError ifTrue: [^sock]
+    check := MintHTTP2 checkAlpn: (MintHTTP1 bare: ((Erlang ssl) negotiated_protocol: (sock value) handle))
+    check isError
+      ifTrue: [
+        (sock value) close
+        ^check
+      ]
+    (MintHTTP2
+      socket: sock value
+      transport: #tls
+      host: host
+      port: port
+      buffer: ""
+      timeout: timeout
+      nextId: 1
+      streams: #{}
+      connSendWindow: MintH2Frame defaultWindow
+      connRecvWindow: MintH2Frame defaultWindow
+      peerMaxFrame: MintH2Frame defaultMaxFrame
+      peerInitWindow: MintH2Frame defaultWindow
+      peerMaxStreams: nil
+      encodeTable: (HPACK newTable: 4096)
+      decodeTable: (HPACK newTable: 4096)
+      goawayLastId: nil) open: timeout
+
+  /// The negotiated ALPN protocol must be `h2`: anything else (or none)
+  /// is an error, since cleartext fallback cannot apply mid-handshake.
+  class sealed checkAlpn: neg :: Result(Dynamic, Object) -> Result(Nil, Object) =>
+    neg isError ifTrue: [^Result error: "ALPN h2 required but not negotiated"]
+    neg value =:= MintHTTP2 alpnProtocol ifTrue: [^Result ok: nil]
+    Result error: "unexpected ALPN protocol: h2 required"
+
+  /// Send the preface and empty `SETTINGS`, then read the server's
+  /// `SETTINGS` and acknowledge it. Anything else first is a protocol
+  /// error (RFC 9113 §3.4).
+  open: ms :: Integer -> Result(MintHTTP2, Object) =>
+    sent := self sendBytes: (MintH2Frame preface concat: MintH2Frame emptySettings)
+    sent isError ifTrue: [^sent]
+    taken := sent value takeFrame: ms
+    taken isError ifTrue: [^taken]
+    conn := taken value at: 1
+    frame := taken value at: 2
+    (frame at: 1) =:= #settings
+      ifFalse: [^conn die: "expected SETTINGS as first frame" code: MintH2Frame protocolError]
+    applied := conn applyPeerSettings: (frame at: 2)
+    applied isError ifTrue: [^conn die: applied error code: MintH2Frame protocolError]
+    acked := applied value sendBytes: MintH2Frame settingsAck
+    acked isError ifTrue: [^acked]
+    Result ok: acked value
+
+  // ===== Transport =====
+
+  /// Send bytes, closing best effort on failure (the connection is
+  /// unusable afterwards — drop it, as in `MintHTTP1`).
+  sendBytes: bytes :: String | Binary -> Result(MintHTTP2, Object) =>
+    sock := self socket
+    sock isNil ifTrue: [^Result error: #closed]
+    sent := sock send: bytes
+    sent isError
+      ifTrue: [
+        sock close
+        ^Result error: sent error
+      ]
+    Result ok: self
+
+  /// Receive available bytes (length 0: whatever has arrived).
+  recv: ms :: Integer -> Result(Binary, Object) =>
+    sock := self socket
+    sock isNil ifTrue: [^Result error: #no_socket_data]
+    sock recv: ms
+
+  /// Read one frame, pumping `recv` while the buffer holds less than a
+  /// full frame. Answers `Result ok:` with `{conn, frame}`.
+  takeFrame: ms :: Integer -> Result(Tuple, Object) =>
+    parsed := MintH2Frame parse: self buffer maxFrame: MintH2Frame defaultMaxFrame
+    parsed =:= #more
+      ifTrue: [
+        chunk := self recv: ms
+        chunk isError ifTrue: [^chunk]
+        ^(self withBuffer: (self buffer concat: chunk value)) takeFrame: ms
+      ]
+    (parsed at: 1) =:= #error ifTrue: [^Result error: (parsed at: 2)]
+    Result ok: {(self withBuffer: (parsed at: 3)), (parsed at: 2)}
+
+  /// Answer a connection error: `GOAWAY` goes out best effort, the
+  /// socket closes, and the message comes back as `Result error:`.
+  die: message :: String code: code :: Integer -> Result(Dynamic, Object) =>
+    self sendGoaway: code
+    sock := self socket
+    sock isNil ifFalse: [sock close]
+    Result error: message
+
+  /// Send a `GOAWAY` with the last sent stream id, ignoring failures
+  /// (answers the unchanged connection for chaining).
+  sendGoaway: code :: Integer -> MintHTTP2 =>
+    sock := self socket
+    sock isNil ifTrue: [^self]
+    last := self nextId - 2
+    last < 0 ifTrue: [last := 0]
+    sock send: (MintH2Frame goaway: last code: code)
+    self
+
+  /// Whether the connection can take another request (a socket that
+  /// has not seen `GOAWAY`).
+  isOpen -> Boolean =>
+    self socket isNil ifTrue: [^false]
+    self goawayLastId isNil
+
+  /// How many streams are still open.
+  openRequestCount -> Integer => self openCount
+
+  /// The number of streams that have not completed.
+  openCount -> Integer =>
+    count := 0
+    self streams keys do: [:sid |
+      entry :: Dictionary(Symbol, Object) := self streams at: sid
+      done :: Boolean := entry at: #done
+      done ifFalse: [count := count + 1]
+    ]
+    count
+
+  /// Close the socket (best effort, with `GOAWAY`) and answer a closed
+  /// connection.
+  close -> MintHTTP2 =>
+    self sendGoaway: MintH2Frame noError
+    sock := self socket
+    sock isNil ifFalse: [sock close]
+    self withSocket: nil
+
+  // ===== Request =====
+
+  /// Send a request head and body. Answers `Result ok:` with
+  /// `{conn, ref}`: the live connection and the stream id tagging this
+  /// response's parts in `stream`. Any number of requests may be in
+  /// flight; a closed connection (or a received `GOAWAY`, or the peer's
+  /// `max_concurrent_streams`) answers an error.
+  ///
+  /// - `method` — e.g. `"GET"` (case-insensitive, sent uppercased).
+  /// - `target` — the origin-form path, e.g. `"/get?x=1"`.
+  /// - `headers` — pre-rendered `"name: value"` lines (values already
+  ///   text); `host` and `content-length` are never added (framing is
+  ///   `END_STREAM`, not lengths).
+  /// - `body` — a String or Binary (empty bodies ride on `HEADERS`
+  ///   with `END_STREAM`; the rest streams as `DATA`).
+  request: method :: String target: target :: String headers: headers :: List(String) body: body :: String | Binary -> Result(Tuple, Object) =>
+    self socket isNil ifTrue: [^Result error: #closed]
+    self goawayLastId isNil ifFalse: [^Result error: #closed]
+    overLimit := self peerMaxStreams match: [
+      limit :: Integer -> self openCount >= limit;
+      _ -> false
+    ]
+    overLimit ifTrue: [^Result error: #too_many_streams]
+    sid := self nextId
+    built := self encodeRequest: method target: target headers: headers
+    built isError ifTrue: [^built]
+    conn := built value at: 1
+    fragment := built value at: 2
+    bodyBin := Binary fromIolist: body
+    wire := MintH2Frame
+      headers: sid
+      endStream: (bodyBin size =:= 0)
+      fragment: fragment
+      maxFrame: conn peerMaxFrame
+    sent := conn sendBytes: wire
+    sent isError ifTrue: [^sent]
+    live := (sent value withNextId: sid + 2) withStreams: (sent value streams at: sid put: (self newStream: bodyBin))
+    flushed := live flushStream: sid
+    flushed isError ifTrue: [^flushed]
+    Result ok: {flushed value, sid}
+
+  /// A fresh stream record: the request body waits in `#pending` until
+  /// the send windows let it out; `#frag` accumulates a split response
+  /// header block.
+  newStream: body :: Binary -> Dictionary(Symbol, Object) =>
+    #{#done => false, #status => nil, #headers => nil, #body => (Binary fromBytes: #()), #sendWindow => self peerInitWindow, #recvWindow => MintH2Frame defaultWindow, #pending => body, #frag => nil, #endStreamSent => false}
+
+  /// HPACK-encode the pseudo-headers plus user headers, answering
+  /// `Result ok:` with `{conn, fragment}` (the connection threads the
+  /// updated encoder table).
+  encodeRequest: method :: String target: target :: String headers: headers :: List(String) -> Result(Tuple, Object) =>
+    pairs := self pseudoHeaders: method target: target
+    parsed := self userHeaders: headers
+    parsed isError ifTrue: [^parsed]
+    all := pairs ++ parsed value
+    enc := self encodeTable
+    enc isNil ifTrue: [^Result error: "no HPACK encoder"]
+    {io, enc2} := HPACK encode: #no_store headers: all table: enc
+    Result ok: {(self withEncodeTable: enc2), (Binary fromIolist: io)}
+
+  /// The `:method`, `:path`, `:scheme` and `:authority` pairs as
+  /// `{name, value}` Binaries.
+  pseudoHeaders: method :: String target: target :: String -> List(Tuple) =>
+    scheme := self transport =:= #tls ifTrue: ["https"] ifFalse: ["http"]
+    #({(Binary fromIolist: ":method"), (Binary fromIolist: method uppercase)}, {(Binary fromIolist: ":path"), (Binary fromIolist: target)}, {(Binary fromIolist: ":scheme"), (Binary fromIolist: scheme)}, {(Binary fromIolist: ":authority"), (Binary fromIolist: self hostHeader)})
+
+  /// Parse user `"name: value"` lines into `{name, value}` Binary pairs
+  /// (names lowercase, values raw).
+  userHeaders: headers :: List(String) -> Result(List(Tuple), Object) =>
+    out :: List(Tuple) := #()
+    1
+      to: headers size
+      do: [:i |
+        parsed := MintHTTP1 parseHeader: (Binary fromIolist: (headers at: i))
+        parsed isError ifTrue: [^parsed]
+        header := parsed value
+        value := header value
+        out := out ++ #({(Binary fromIolist: header name), ((value isKindOf: Binary) ifTrue: [value] ifFalse: [Binary fromIolist: value])})
+      ]
+    Result ok: out
+
+  /// The `:authority` value: the host, plus the port when non-default.
+  hostHeader -> String =>
+    default := self transport =:= #tls ifTrue: [443] ifFalse: [80]
+    self port =:= default ifTrue: [
+      ^self host
+    ] ifFalse: [^self host ++ ":" ++ self port printString]
+
+  /// Send as much of the stream's pending body as the connection and
+  /// stream windows allow (capped at the peer's max frame size),
+  /// closing the stream with `END_STREAM` when the last byte goes out.
+  /// Answers `Result ok:` with the connection.
+  flushStream: sid :: Integer -> Result(MintHTTP2, Object) =>
+    stream :: Dictionary(Symbol, Object) := self streams at: sid ifAbsent: [^Result ok: self]
+    pending :: Binary := stream at: #pending
+    pending size =:= 0
+      ifTrue: [
+        sentFlag :: Boolean := stream at: #endStreamSent
+        sentFlag ifTrue: [^Result ok: self]
+        sent := self sendBytes: (MintH2Frame dataEnd: sid)
+        sent isError ifTrue: [^sent]
+        ^Result ok: (sent value withStream: sid put: (stream at: #endStreamSent put: true))
+      ]
+    sendWindow :: Integer := stream at: #sendWindow
+    room := self connSendWindow
+    sendWindow < room ifTrue: [room := sendWindow]
+    self peerMaxFrame < room ifTrue: [room := self peerMaxFrame]
+    pending size < room ifTrue: [room := pending size]
+    room <= 0 ifTrue: [^Result ok: self]
+    chunk := pending part: 0 size: room
+    sent := self sendBytes: (MintH2Frame datas: sid bytes: chunk maxFrame: self peerMaxFrame)
+    sent isError ifTrue: [^sent]
+    moved := sent value
+    rest := pending part: room size: (pending size - room)
+    restEmpty := rest size =:= 0
+    updated := (stream at: #pending put: rest) at: #endStreamSent put: restEmpty
+    updated := updated at: #sendWindow put: sendWindow - room
+    conn := (moved withConnSendWindow: moved connSendWindow - room) withStream: sid put: updated
+    restEmpty
+      ifTrue: [
+        ended := conn sendBytes: (MintH2Frame dataEnd: sid)
+        ended isError ifTrue: [^ended]
+        ^Result ok: ended value
+      ]
+    Result ok: conn
+
+  /// Send every pending body that fits (after a connection-level
+  /// `WINDOW_UPDATE`).
+  flushAll -> Result(MintHTTP2, Object) =>
+    self flushStreams: self streams keys
+
+  /// Flush one pending stream per id, threading the connection.
+  flushStreams: ids :: List(Integer) -> Result(MintHTTP2, Object) =>
+    ids isEmpty ifTrue: [^Result ok: self]
+    flushed := self flushStream: ids first
+    flushed isError ifTrue: [^flushed]
+    flushed value flushStreams: ids rest
+
+  /// Store `stream` under `sid`.
+  withStream: sid :: Integer put: stream :: Dictionary(Symbol, Object) -> MintHTTP2 =>
+    self withStreams: (self streams at: sid put: stream)
+
+  /// Drop the stream record for `sid`.
+  withoutStream: sid :: Integer -> MintHTTP2 =>
+    remaining := self streams
+    (remaining at: sid ifAbsent: [nil]) isNil ifTrue: [^self]
+    kept :: Dictionary(Integer, Object) := #{}
+    remaining keys do: [:each |
+      each =:= sid ifFalse: [
+        kept := kept at: each put: (remaining at: each)
+      ]
+    ]
+    self withStreams: kept
+
+  // ===== Stream =====
+
+  /// Read this reference's full response. Answers `Result ok:` with
+  /// `{conn, parts}`: the connection (other streams' progress stays
+  /// buffered in it) and the Mint parts — `{#status, ref, code}`,
+  /// `{#headers, ref, headers}`, zero or one `{#data, ref, bytes}`,
+  /// and `{#done, ref}`. A reset stream answers `Result error:` with
+  /// `{#reset, code}`; an unknown reference answers `#unknown_ref`.
+  stream: ref :: Integer timeout: ms :: Integer -> Result(Tuple, Object) =>
+    stream :: Dictionary(Symbol, Object) := self streams at: ref ifAbsent: [^Result error: #unknown_ref]
+    done :: Boolean := stream at: #done
+    done ifTrue: [^Result ok: {(self withoutStream: ref), (self partsFor: ref stream: stream)}]
+    self pump: ref ms: ms
+
+  /// Read frames until `ref` completes: `{#done, conn, parts}` when its
+  /// `END_STREAM` arrives, `{#error, reason}` when the connection (or
+  /// the stream, via `{#reset, code}`) dies.
+  pump: ref :: Integer ms: ms :: Integer -> Result(Tuple, Object) =>
+    taken := self takeFrame: ms
+    taken isError ifTrue: [^taken]
+    conn :: MintHTTP2 := taken value at: 1
+    handled := conn handle: (taken value at: 2) for: ref
+    tag := handled at: 1
+    tag =:= #continue ifTrue: [^(handled at: 2) pump: ref ms: ms]
+    tag =:= #done ifTrue: [^Result ok: {(handled at: 2), (handled at: 3)}]
+    Result error: (handled at: 2)
+
+  /// Handle one frame for the stream `ref` is waiting on:
+  /// `{#continue, conn}`, `{#done, conn, parts}`, or
+  /// `{#error, reason}` (the connection is already closed).
+  handle: frame :: Tuple for: ref :: Integer -> Tuple =>
+    tag := frame at: 1
+    tag =:= #settings ifTrue: [^self handleSettings: frame]
+    tag =:= #settingsAck ifTrue: [^{#continue, self}]
+    tag =:= #ping ifTrue: [^self handlePing: frame]
+    tag =:= #windowUpdate ifTrue: [^self handleWindowUpdate: frame]
+    tag =:= #goaway ifTrue: [^self handleGoaway: frame]
+    tag =:= #headers ifTrue: [^self handleHeaders: frame for: ref]
+    tag =:= #continuation ifTrue: [^self handleContinuation: frame for: ref]
+    tag =:= #data ifTrue: [^self handleData: frame for: ref]
+    tag =:= #rstStream ifTrue: [^self handleReset: frame for: ref]
+    {#continue, self}
+
+  /// Apply peer settings (acknowledging them); invalid values kill the
+  /// connection with a protocol error.
+  handleSettings: frame :: Tuple -> Tuple =>
+    params :: Dictionary(Symbol, Object) := frame at: 2
+    applied := self applyPeerSettings: params
+    applied isError ifTrue: [
+      reason :: String := applied error
+      died := self die: reason code: MintH2Frame protocolError
+      ^{#error, died error}
+    ]
+    acked := applied value sendBytes: MintH2Frame settingsAck
+    acked isError ifTrue: [^{#error, acked error}]
+    {#continue, acked value}
+
+  /// Apply a peer `SETTINGS` payload: `initial_window_size` re-scales
+  /// open streams' send windows, `header_table_size` resizes the HPACK
+  /// encoder, `max_frame_size` caps sends, `max_concurrent_streams`
+  /// caps new requests. Answers `Result ok:` with the connection.
+  applyPeerSettings: params :: Dictionary(Symbol, Object) -> Result(MintHTTP2, Object) =>
+    badWindow := (params at: #initial_window_size ifAbsent: [nil]) match: [
+      v :: Integer -> v > 2147483647;
+      _ -> false
+    ]
+    badWindow ifTrue: [^Result error: "Invalid window_size"]
+    conn := self
+    tableSize := params at: #header_table_size ifAbsent: [nil]
+    tableSize match: [
+      v :: Integer -> conn := conn withEncodeTable: (HPACK resize: conn checkedEncodeTable newMax: v);
+      _ -> nil
+    ]
+    oldWindow := conn peerInitWindow
+    initWindow := params at: #initial_window_size ifAbsent: [nil]
+    initWindow match: [
+      v :: Integer -> conn := (conn withPeerInitWindow: v) rescale: v - oldWindow;
+      _ -> nil
+    ]
+    maxFrame := params at: #max_frame_size ifAbsent: [nil]
+    maxFrame match: [
+      v :: Integer -> conn := conn withPeerMaxFrame: v;
+      _ -> nil
+    ]
+    maxStreams := params at: #max_concurrent_streams ifAbsent: [nil]
+    maxStreams match: [
+      v :: Integer -> conn := conn withPeerMaxStreams: v;
+      _ -> nil
+    ]
+    Result ok: conn
+
+  /// Shift every open stream's send window by `delta` (a peer
+  /// `initial_window_size` change applies to existing streams too —
+  /// RFC 9113 §6.9.2).
+  rescale: delta :: Integer -> MintHTTP2 =>
+    scaled := self
+    self streams keys do: [:sid |
+      entry :: Dictionary(Symbol, Object) := scaled streams at: sid
+      window :: Integer := entry at: #sendWindow
+      scaled := scaled withStream: sid put: (entry at: #sendWindow put: window + delta)
+    ]
+    scaled
+
+  /// The encoder table, falling back to a fresh default (connections
+  /// built by `connect:` always set it).
+  checkedEncodeTable -> HPACKTable =>
+    self encodeTable match: [
+      t :: HPACKTable -> t;
+      _ -> HPACK newTable: 4096
+    ]
+
+  /// Answer an incoming `PING` (acks are ignored).
+  handlePing: frame :: Tuple -> Tuple =>
+    ack :: Boolean := frame at: 2
+    ack
+      ifTrue: [^{#continue, self}]
+      ifFalse: [
+        payload :: Binary := frame at: 3
+        acked := self sendBytes: (MintH2Frame pingAck: payload)
+        acked isError ifTrue: [^{#error, acked error}]
+        {#continue, acked value}
+      ]
+
+  /// Grow the send windows and flush stalled bodies.
+  handleWindowUpdate: frame :: Tuple -> Tuple =>
+    sid :: Integer := frame at: 2
+    inc :: Integer := frame at: 3
+    sid =:= 0
+      ifTrue: [
+        grown := self withConnSendWindow: self connSendWindow + inc
+        flushed := grown flushAll
+        flushed isError ifTrue: [^{#error, flushed error}]
+        ^{#continue, flushed value}
+      ]
+      ifFalse: [
+        stream :: Dictionary(Symbol, Object) := self streams at: sid ifAbsent: [^{#continue, self}]
+        window :: Integer := stream at: #sendWindow
+        grown := self withStream: sid put: (stream at: #sendWindow put: window + inc)
+        flushed := grown flushStream: sid
+        flushed isError ifTrue: [^{#error, flushed error}]
+        {#continue, flushed value}
+      ]
+
+  /// Remember the peer is going away; open streams run to completion.
+  handleGoaway: frame :: Tuple -> Tuple =>
+    last :: Integer := frame at: 2
+    {#continue, (self withGoawayLastId: last)}
+
+  /// A response HEADERS block: buffer it when split across
+  /// CONTINUATIONs, decode it when complete.
+  handleHeaders: frame :: Tuple for: ref :: Integer -> Tuple =>
+    sid :: Integer := frame at: 2
+    endStream :: Boolean := frame at: 3
+    endHeaders :: Boolean := frame at: 4
+    frag :: Binary := frame at: 5
+    stream :: Dictionary(Symbol, Object) := self streams at: sid ifAbsent: [^
+      (self die: "HEADERS for unknown stream" code: MintH2Frame protocolError) match: [
+        _ -> {#error, "HEADERS for unknown stream"}
+      ]
+    ]
+    (stream at: #frag) isNil ifFalse: [^
+      (self die: "HEADERS while header block continues" code: MintH2Frame protocolError) match: [
+        _ -> {#error, "HEADERS while header block continues"}
+      ]
+    ]
+    endHeaders
+      ifTrue: [^self decodeHeaders: frag stream: stream sid: sid endStream: endStream for: ref]
+      ifFalse: [^{#continue, (self withStream: sid put: (stream at: #frag put: frag))}]
+
+  /// A CONTINUATION frame: it must extend a buffered header block.
+  handleContinuation: frame :: Tuple for: ref :: Integer -> Tuple =>
+    sid :: Integer := frame at: 2
+    endHeaders :: Boolean := frame at: 3
+    frag :: Binary := frame at: 4
+    stream :: Dictionary(Symbol, Object) := self streams at: sid ifAbsent: [^
+      (self die: "CONTINUATION for unknown stream" code: MintH2Frame protocolError) match: [
+        _ -> {#error, "CONTINUATION for unknown stream"}
+      ]
+    ]
+    buffered := stream at: #frag
+    buffered isNil ifTrue: [^
+      (self die: "CONTINUATION without header block" code: MintH2Frame protocolError) match: [
+        _ -> {#error, "CONTINUATION without header block"}
+      ]
+    ]
+    prior :: Binary := buffered
+    full := prior concat: frag
+    endHeaders
+      ifTrue: [^self decodeHeaders: full stream: (stream at: #frag put: nil) sid: sid endStream: false for: ref]
+      ifFalse: [^{#continue, (self withStream: sid put: (stream at: #frag put: full))}]
+
+  /// HPACK-decode a complete header block into the stream, marking it
+  /// done when `END_STREAM` rode along. Trailers (a second block on a
+  /// stream that already has headers) are decoded and discarded.
+  decodeHeaders: frag :: Binary stream: current :: Dictionary(Symbol, Object) sid: sid :: Integer endStream: endStream :: Boolean for: ref :: Integer -> Tuple =>
+    rawDec := self decodeTable
+    rawDec isNil ifTrue: [^
+      (self die: "no HPACK decoder" code: MintH2Frame compressionError) match: [
+        _ -> {#error, "no HPACK decoder"}
+      ]
+    ]
+    decoded := HPACK decode: frag table: rawDec
+    (decoded at: 1) =:= #error ifTrue: [^
+      (self die: "HPACK decode failed" code: MintH2Frame compressionError) match: [
+        _ -> {#error, "HPACK decode failed"}
+      ]
+    ]
+    pairs :: List(Tuple) := decoded at: 2
+    table2 :: HPACKTable := decoded at: 3
+    conn := self withDecodeTable: table2
+    (current at: #headers) isNil
+      ifFalse: [
+        ended := conn withStream: sid put: ((current at: #frag put: nil) at: #done put: endStream)
+        doneStream :: Dictionary(Symbol, Object) := ended streams at: sid
+        endStream ifTrue: [^ended collectDone: sid stream: doneStream for: ref]
+        ^{#continue, ended}
+      ]
+    split := conn splitResponse: pairs
+    (split at: 1) =:= #error ifTrue: [
+      reason :: String := split at: 2
+      died := conn die: reason code: MintH2Frame protocolError
+      ^{#error, died error}
+    ]
+    status :: Integer := split at: 2
+    headList :: List(MintHeader) := split at: 3
+    updated := ((current at: #frag put: nil) at: #headers put: headList) at: #status put: status
+    updated := endStream ifTrue: [(updated at: #done put: true)] ifFalse: [updated]
+    ended := conn withStream: sid put: updated
+    doneStream :: Dictionary(Symbol, Object) := ended streams at: sid
+    endStream ifTrue: [^ended collectDone: sid stream: doneStream for: ref]
+    {#continue, ended}
+
+  /// Split decoded `{name, value}` Binary pairs into `{#ok, status,
+  /// headers}` (`:status` plus `MintHeader`s) or `{#error, message}`.
+  splitResponse: headers :: List(Tuple) -> Tuple =>
+    status :: Integer | Nil := nil
+    out :: List(MintHeader) := #()
+    1
+      to: headers size
+      do: [:i |
+        pair := headers at: i
+        name :: Binary := pair at: 1
+        value :: Binary := pair at: 2
+        text := name asStringUnchecked
+        (text startsWith: ":")
+          ifTrue: [
+            text =:= ":status" ifTrue: [
+              parsed := MintHTTP1 parseDecimal: value asStringUnchecked
+              parsed isError ifTrue: [^{#error, "bad :status"}]
+              status := parsed value
+            ]
+          ]
+          ifFalse: [
+            out := out ++ #((MintHeader name: text lowercase value: (MintHTTP1 stringOrOpaque: value)))
+          ]
+      ]
+    status match: [
+      code :: Integer -> {#ok, code, out};
+      _ -> {#error, "missing :status"}
+    ]
+
+  /// A response DATA frame: flow-control accounting first (an overdrawn
+  /// window kills the connection), then buffer and maybe replenish.
+  handleData: frame :: Tuple for: ref :: Integer -> Tuple =>
+    sid :: Integer := frame at: 2
+    endStream :: Boolean := frame at: 3
+    bytes :: Binary := frame at: 4
+    stream :: Dictionary(Symbol, Object) := self streams at: sid ifAbsent: [^
+      (self die: "DATA for unknown stream" code: MintH2Frame protocolError) match: [
+        _ -> {#error, "DATA for unknown stream"}
+      ]
+    ]
+    overdrawn := bytes size > self connRecvWindow
+    recvWindow :: Integer := stream at: #recvWindow
+    (overdrawn or: [bytes size > recvWindow]) ifTrue: [^
+      (self die: "flow-control window exceeded" code: MintH2Frame flowControlError) match: [
+        _ -> {#error, "flow-control window exceeded"}
+      ]
+    ]
+    body :: Binary := stream at: #body
+    grown := (self withConnRecvWindow: self connRecvWindow - bytes size) withStream: sid put: ((stream at: #body put: (body concat: bytes)) at: #recvWindow put: recvWindow - bytes size)
+    topped := grown replenish: sid
+    topped isError ifTrue: [^{#error, topped error}]
+    live := topped value
+    endStream
+      ifTrue: [
+        ended := live withStream: sid put: ((live streams at: sid) at: #done put: true)
+        finished :: Dictionary(Symbol, Object) := ended streams at: sid
+        ^ended collectDone: sid stream: finished for: ref
+      ]
+      ifFalse: [^{#continue, live}]
+
+  /// Replenish a half-consumed receive window with a `WINDOW_UPDATE`
+  /// (connection and stream), so a slow reader never stalls the peer.
+  replenish: sid :: Integer -> Result(MintHTTP2, Object) =>
+    half := MintH2Frame defaultWindow - (MintH2Frame defaultWindow div: 2) - 1
+    conn := self
+    self connRecvWindow <= half
+      ifTrue: [
+        topped := conn sendBytes: (MintH2Frame windowUpdate: 0 increment: MintH2Frame defaultWindow - conn connRecvWindow)
+        topped isError ifTrue: [^topped]
+        conn := topped value withConnRecvWindow: MintH2Frame defaultWindow
+      ]
+    stream :: Dictionary(Symbol, Object) := conn streams at: sid ifAbsent: [^Result ok: conn]
+    window :: Integer := stream at: #recvWindow
+    window <= half
+      ifTrue: [
+        topped := conn sendBytes: (MintH2Frame windowUpdate: sid increment: MintH2Frame defaultWindow - window)
+        topped isError ifTrue: [^topped]
+        conn := topped value withStream: sid put: (stream at: #recvWindow put: MintH2Frame defaultWindow)
+      ]
+    Result ok: conn
+
+  /// A RST_STREAM: forget the stream; the waiter gets `{#reset, code}`.
+  handleReset: frame :: Tuple for: ref :: Integer -> Tuple =>
+    sid :: Integer := frame at: 2
+    code :: Integer := frame at: 3
+    forgotten := self withoutStream: sid
+    sid =:= ref ifTrue: [^{#error, {#reset, code}}]
+    {#continue, forgotten}
+
+  /// Collect a completed stream: `{#done, conn, parts}` when it is the
+  /// waiter, else keep buffering it in the connection.
+  collectDone: sid :: Integer stream: stream :: Dictionary(Symbol, Object) for: ref :: Integer -> Tuple =>
+    sid =:= ref ifTrue: [^{#done, (self withoutStream: sid), (self partsFor: sid stream: stream)}]
+    {#continue, self}
+
+  /// The Mint parts for a completed stream.
+  partsFor: ref :: Integer stream: stream :: Dictionary(Symbol, Object) -> List(Tuple) =>
+    status :: Integer := stream at: #status
+    headers :: List(MintHeader) := stream at: #headers
+    body :: Binary := stream at: #body
+    parts :: List(Tuple) := #({#status, ref, status}, {#headers, ref, headers})
+    body size > 0 ifTrue: [
+      parts := parts ++ #({#data, ref, body})
+    ]
+    parts ++ #({#done, ref})
