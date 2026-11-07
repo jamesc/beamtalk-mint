@@ -1,0 +1,70 @@
+// Copyright 2026 mint authors
+// SPDX-License-Identifier: Apache-2.0
+
+/// A connected socket over `gen_tcp` or `:ssl`: the single place
+/// that branches on transport, so connection code never does. The
+/// handle is an opaque Erlang socket (a port, or an `#sslsocket`
+/// tuple for TLS).
+sealed typed Value subclass: MintSocket
+  field: transport :: Symbol = #tcp
+  field: handle :: Object | Nil = nil
+
+  /// Dial cleartext TCP, answering the connected socket.
+  class sealed connectTcp: ip :: Dynamic port: port :: Integer opts: opts :: List(Object) timeout: ms :: Integer -> Result(MintSocket, Object) =>
+    raw := MintHTTP1
+      bare: ((Erlang gen_tcp)
+        connect: ip
+        port: port
+        opts: opts
+        timeout: ms)
+    raw isError ifTrue: [^Result error: raw error]
+    Result ok: (MintSocket transport: #tcp handle: raw value)
+
+  /// Dial TLS, answering the connected socket (the caller checks
+  /// ALPN on the negotiated protocol afterwards).
+  class sealed connectTls: ip :: Dynamic port: port :: Integer opts: opts :: List(Object) timeout: ms :: Integer -> Result(MintSocket, Object) =>
+    raw := MintHTTP1
+      bare: ((Erlang ssl)
+        connect: ip
+        port: port
+        tlsoptions: opts
+        timeout: ms)
+    raw isError ifTrue: [^Result error: raw error]
+    Result ok: (MintSocket transport: #tls handle: raw value)
+
+  /// Send bytes on this connection's socket.
+  send: bytes :: String | Binary -> Result(Nil, Object) =>
+    wire := bytes
+    MintHTTP1
+      bare: (self transport =:= #tls ifTrue: [
+        (Erlang ssl) send: self handle with: wire
+      ] ifFalse: [(Erlang gen_tcp) send: self handle with: wire])
+
+  /// Receive available bytes (length 0: whatever has arrived).
+  recv: ms :: Integer -> Result(Binary, Object) =>
+    raw := MintHTTP1
+      bare: (self transport =:= #tls
+        ifTrue: [
+          (Erlang ssl)
+            recv: self handle
+            with: 0
+            with: ms
+        ]
+        ifFalse: [
+          (Erlang gen_tcp)
+            recv: self handle
+            with: 0
+            with: ms
+        ])
+    raw isError ifTrue: [^Result error: raw error]
+    Result ok: raw value
+
+  /// Close the socket, ignoring errors (best effort). Answers
+  /// `ok` either way; a Value cannot have void methods (ADR 0042),
+  /// so the no-op shapes as a `Result` like `send:` and `recv:`.
+  close -> Result(Nil, Object) =>
+    self handle isNil ifTrue: [^Result ok: nil]
+    self transport =:= #tls ifTrue: [
+      (Erlang ssl) close: self handle
+    ] ifFalse: [(Erlang gen_tcp) close: self handle]
+    Result ok: nil

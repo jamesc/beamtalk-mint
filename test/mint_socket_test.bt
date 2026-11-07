@@ -1,0 +1,20 @@
+// Copyright 2026 mint authors
+// SPDX-License-Identifier: Apache-2.0
+
+/// Construction and dispatch of the transport wrapper: the real
+/// send/receive paths run through the integration tests.
+TestCase subclass: MintSocketTest
+
+  testWrapTcp =>
+    sock := MintSocket transport: #tcp handle: nil
+    self assert: sock transport equals: #tcp
+    self assert: sock handle isNil
+
+  testWrapTls =>
+    sock := MintSocket transport: #tls handle: nil
+    self assert: sock transport equals: #tls
+    self assert: sock handle isNil
+
+  testCloseNilHandleAnswersOk =>
+    sock := MintSocket transport: #tcp handle: nil
+    self assert: (sock close) isOk

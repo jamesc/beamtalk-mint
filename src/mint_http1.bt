@@ -46,7 +46,10 @@
 /// proceeds as HTTP/1.1; a *different* negotiated protocol (e.g.
 /// `"h2"`) is an error.
 sealed typed Value subclass: MintHTTP1
-  field: socket :: Object | Nil = nil
+  field: socket :: MintSocket | Nil = nil
+  // Mirrors the socket's transport for header decisions on open
+  // connections (host header default port); the socket itself
+  // dispatches sends, receives, and closes.
   field: transport :: Symbol = #tcp
   field: host :: String = ""
   field: port :: Integer = 80
@@ -125,16 +128,15 @@ sealed typed Value subclass: MintHTTP1
     timeout := self timeoutOf: opts
     ip := self resolve: host
     ip isError ifTrue: [^ip]
-    raw := MintHTTP1
-      bare: ((Erlang gen_tcp)
-        connect: ip value
-        port: port
-        opts: #(#binary, {#packet, #raw}, {#active, false})
-        timeout: timeout)
-    raw isError ifTrue: [^Result error: raw error]
+    sock := MintSocket
+      connectTcp: ip value
+      port: port
+      opts: #(#binary, {#packet, #raw}, {#active, false})
+      timeout: timeout
+    sock isError ifTrue: [^sock]
     Result
       ok: (MintHTTP1
-        socket: raw value
+        socket: sock value
         transport: #tcp
         host: host
         port: port
@@ -162,23 +164,21 @@ sealed typed Value subclass: MintHTTP1
       ifFalse: [
         #(#binary, {#packet, #raw}, {#active, false}, {#verify, verify}, {#alpn_advertised_protocols, alpn}, {#server_name_indication, sni})
       ]
-    raw := MintHTTP1
-      bare: ((Erlang ssl)
-        connect: ip value
-        port: port
-        tlsoptions: rawOpts
-        timeout: timeout)
-    raw isError ifTrue: [^Result error: raw error]
-    sock :: Object := raw value
-    check := self checkAlpn: (MintHTTP1 bare: ((Erlang ssl) negotiated_protocol: sock)) offered: alpn
+    sock := MintSocket
+      connectTls: ip value
+      port: port
+      opts: rawOpts
+      timeout: timeout
+    sock isError ifTrue: [^sock]
+    check := self checkAlpn: (MintHTTP1 bare: ((Erlang ssl) negotiated_protocol: (sock value) handle)) offered: alpn
     check isError
       ifTrue: [
-        self closeSocket: sock transport: #tls
+        (sock value) close
         ^check
       ]
     Result
       ok: (MintHTTP1
-        socket: sock
+        socket: sock value
         transport: #tls
         host: host
         port: port
@@ -232,13 +232,6 @@ sealed typed Value subclass: MintHTTP1
       nextRef: 0
       inFlightRef: nil
       inFlightMethod: ""
-
-  /// Close a raw socket, ignoring errors.
-  class sealed closeSocket: sock :: Object transport: t :: Symbol -> Nil =>
-    t =:= #tls ifTrue: [
-      (Erlang ssl) close: sock
-    ] ifFalse: [(Erlang gen_tcp) close: sock]
-    nil
 
   /// Parse head bytes into `{version, status, headers}`: `version` is
   /// `{#http1, major, minor}`. Answers a `Result error:` on malformed
@@ -457,9 +450,8 @@ sealed typed Value subclass: MintHTTP1
 
   /// Close the socket (best effort) and answer a closed connection.
   close -> MintHTTP1 =>
-    self socket isNil ifFalse: [
-      self class closeSocket: self socket transport: self transport
-    ]
+    sock := self socket
+    sock isNil ifFalse: [sock close]
     self withSocket: nil
 
   // ===== Request =====
@@ -534,13 +526,13 @@ sealed typed Value subclass: MintHTTP1
       ^self host
     ] ifFalse: [^self host ++ ":" ++ self port printString]
 
-  /// Send bytes on this connection's socket.
-  send: bytes :: Object -> Result(Nil, Object) =>
-    wire := bytes
-    MintHTTP1
-      bare: (self transport =:= #tls ifTrue: [
-        (Erlang ssl) send: self socket with: wire
-      ] ifFalse: [(Erlang gen_tcp) send: self socket with: wire])
+  /// Send bytes on this connection's socket. A closed connection
+  /// answers `#closed` (request: guards this first; the check keeps
+  /// the socket provably non-nil for the checker).
+  send: bytes :: String | Binary -> Result(Nil, Object) =>
+    sock := self socket
+    sock isNil ifTrue: [^Result error: #closed]
+    sock send: bytes
 
   // ===== Stream =====
 
@@ -579,22 +571,7 @@ sealed typed Value subclass: MintHTTP1
   recv: ms :: Integer -> Result(Binary, Object) =>
     sock := self socket
     sock isNil ifTrue: [^Result error: #no_socket_data]
-    raw := MintHTTP1
-      bare: (self transport =:= #tls
-        ifTrue: [
-          (Erlang ssl)
-            recv: sock
-            with: 0
-            with: ms
-        ]
-        ifFalse: [
-          (Erlang gen_tcp)
-            recv: sock
-            with: 0
-            with: ms
-        ])
-    raw isError ifTrue: [^Result error: raw error]
-    Result ok: raw value
+    sock recv: ms
 
   /// Read through the response head, skipping `1xx` interim responses.
   /// Answers `Result ok:` with `{conn, version, status, headers}`.

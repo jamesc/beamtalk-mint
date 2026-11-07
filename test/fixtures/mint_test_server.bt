@@ -9,8 +9,8 @@
 /// `acceptNext` runs the accept/handshake half for the ALPN-mismatch
 /// test, where the client never sends HTTP.
 Actor subclass: MintTestServer
-  state: lsock :: Object | Nil = nil
-  state: conn :: Object | Nil = nil
+  state: lsock :: MintSocket | Nil = nil
+  state: conn :: MintSocket | Nil = nil
   state: useTls = nil
   state: rest :: Binary = Binary fromBytes: #()
 
@@ -18,9 +18,9 @@ Actor subclass: MintTestServer
   startPlain -> Result(Integer, Object) =>
     raw := MintHTTP1 bare: ((Erlang gen_tcp) listen: 0 with: #(#binary, {#packet, #raw}, {#active, false}, {#reuseaddr, true}, {#ip, {127, 0, 0, 1}}))
     raw isError ifTrue: [^raw]
-    self.lsock := raw value
     self.useTls := false
-    self boundPort: self.lsock
+    self.lsock := MintSocket transport: #tcp handle: raw value
+    self boundPort: self.lsock handle
 
   /// Bind loopback port 0 over TLS (`alpn` is the advertised list, or
   /// nil for none). Answers `Result ok:` the port.
@@ -37,9 +37,9 @@ Actor subclass: MintTestServer
     started isError ifTrue: [^started]
     raw := MintHTTP1 bare: ((Erlang ssl) listen: 0 with: full)
     raw isError ifTrue: [^raw]
-    self.lsock := raw value
     self.useTls := true
-    named := MintHTTP1 bare: ((Erlang ssl) sockname: self.lsock)
+    self.lsock := MintSocket transport: #tls handle: raw value
+    named := MintHTTP1 bare: ((Erlang ssl) sockname: self.lsock handle)
     named isError ifTrue: [^named]
     {_addr, port} := named value
     Result ok: port
@@ -85,42 +85,37 @@ Actor subclass: MintTestServer
   /// Close the connection and listener (best effort).
   shutdown -> Nil =>
     self closeConn
-    self.lsock isNil
-      ifFalse: [
-        self.useTls ifTrue: [
-          (Erlang ssl) close: self.lsock
-        ] ifFalse: [(Erlang gen_tcp) close: self.lsock]
-      ]
+    self.lsock isNil ifFalse: [self.lsock close]
     self.lsock := nil
     nil
 
   /// The active connection, accepting (and handshaking) when needed.
   ensureConn -> Result(Dynamic, Object) =>
     self.conn isNil ifFalse: [^Result ok: self.conn]
-    acc := self.useTls ifTrue: [
-      MintHTTP1 bare: ((Erlang ssl) transport_accept: self.lsock timeout: 5000)
-    ] ifFalse: [
-      MintHTTP1 bare: ((Erlang gen_tcp) accept: self.lsock timeout: 5000)
-    ]
+    acc := self.useTls
+      ifTrue: [
+        MintHTTP1 bare: ((Erlang ssl) transport_accept: self.lsock handle timeout: 5000)
+      ]
+      ifFalse: [
+        MintHTTP1 bare: ((Erlang gen_tcp) accept: self.lsock handle timeout: 5000)
+      ]
     acc isError ifTrue: [^acc]
-    sock := acc value
+    raw := acc value
     self.useTls
       ifTrue: [
-        hs := MintHTTP1 bare: ((Erlang ssl) handshake: sock)
+        hs := MintHTTP1 bare: ((Erlang ssl) handshake: raw)
         hs isError ifTrue: [^hs]
-        sock := hs value
+        raw := hs value
       ]
+    sock := MintSocket transport: (self.useTls ifTrue: [
+      #tls
+    ] ifFalse: [#tcp]) handle: raw
     self.conn := sock
     Result ok: sock
 
   /// Drop the active connection (best effort).
   closeConn -> Nil =>
-    self.conn isNil
-      ifFalse: [
-        self.useTls ifTrue: [
-          (Erlang ssl) close: self.conn
-        ] ifFalse: [(Erlang gen_tcp) close: self.conn]
-      ]
+    self.conn isNil ifFalse: [self.conn close]
     self.conn := nil
     self.rest := Binary fromBytes: #()
     nil
@@ -243,24 +238,7 @@ Actor subclass: MintTestServer
     Result ok: nil
 
   /// Receive available bytes.
-  recv: sock -> Result(Binary, Object) =>
-    raw := self.useTls
-      ifTrue: [
-        MintHTTP1
-          bare: ((Erlang ssl)
-            recv: sock
-            with: 0
-            with: 5000)
-      ]
-      ifFalse: [
-        MintHTTP1
-          bare: ((Erlang gen_tcp)
-            recv: sock
-            with: 0
-            with: 5000)
-      ]
-    raw isError ifTrue: [^Result error: raw error]
-    Result ok: raw value
+  recv: sock -> Result(Binary, Object) => sock recv: 5000
 
   // ===== Responding =====
 
@@ -404,12 +382,7 @@ Actor subclass: MintTestServer
     false
 
   /// Send bytes on the connection.
-  send: bytes :: Binary socket: sock -> Result(Nil, Object) =>
-    sent := self.useTls ifTrue: [
-      MintHTTP1 bare: ((Erlang ssl) send: sock with: bytes)
-    ] ifFalse: [MintHTTP1 bare: ((Erlang gen_tcp) send: sock with: bytes)]
-    sent isError ifTrue: [^sent]
-    Result ok: nil
+  send: bytes :: Binary socket: sock -> Result(Nil, Object) => sock send: bytes
 
   /// A status reason phrase.
   reasonOf: status :: Integer -> String =>
