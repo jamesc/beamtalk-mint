@@ -1,0 +1,642 @@
+// Copyright 2026 mint authors
+// SPDX-License-Identifier: Apache-2.0
+
+/// Test-only HTTP/2 server for the `MintHTTP2` integration tests: a tiny
+/// choreographed responder over `gen_tcp` (or `ssl`), with no
+/// dependencies beyond `hpack`. The test drives both ends lock-step: it
+/// connects (the client preface handshake runs inside `serveNext:`), then
+/// `serveNext:` reads one request and writes the spec'd response.
+///
+/// The server side of the exchange is deliberately minimal but honest:
+/// it reads the client preface, negotiates `SETTINGS` both ways,
+/// HPACK-decodes request blocks (across `CONTINUATION`s), replenishes
+/// its receive windows, and chunks responses at `maxFrameOut` while
+/// honoring its send windows. Every frame received from the client is
+/// recorded for `receivedFrames` assertions (settings ACKs, pings,
+/// `WINDOW_UPDATE`s, ...).
+Actor subclass: MintH2TestServer
+  state: lsock = nil
+  state: conn = nil
+  state: useTls = nil
+  state: rest = nil
+  state: decodeTable = nil
+  state: encodeTable = nil
+  state: handshakeDone = nil
+  state: serverSettings = nil
+  state: maxFrameOut = nil
+  state: received = nil
+
+  /// Bind loopback port 0 (plain TCP, prior-knowledge `h2c`). Answers
+  /// `Result ok:` the port.
+  startPlain -> Result(Integer, Object) =>
+    raw := MintHTTP1 bare: ((Erlang gen_tcp) listen: 0 with: #(#binary, {#packet, #raw}, {#active, false}, {#reuseaddr, true}, {#ip, {127, 0, 0, 1}}))
+    raw isError ifTrue: [^raw]
+    self.useTls := false
+    self.lsock := MintTcpSocket handle: raw value
+    self resetState
+    named := MintHTTP1 bare: ((Erlang inet) sockname: raw value)
+    named isError ifTrue: [^named]
+    {_addr, port} := named value
+    Result ok: port
+
+  /// Bind loopback port 0 over TLS (`alpn` is the advertised list).
+  /// Answers `Result ok:` the port.
+  startTls: certfile :: String keyfile: keyfile :: String alpn: protos -> Result(Integer, Object) =>
+    full := protos isNil
+      ifTrue: [
+        #(#binary, {#packet, #raw}, {#active, false}, {#reuseaddr, true}, {#ip, {127, 0, 0, 1}}, {#certfile, certfile toBytes}, {#keyfile, keyfile toBytes})
+      ]
+      ifFalse: [
+        #(#binary, {#packet, #raw}, {#active, false}, {#reuseaddr, true}, {#ip, {127, 0, 0, 1}}, {#certfile, certfile toBytes}, {#keyfile, keyfile toBytes}, {#alpn_preferred_protocols, (protos collect: [:p |
+          Binary fromIolist: p
+        ])})
+      ]
+    started := MintHTTP1 bare: ((Erlang application) ensure_all_started: #ssl)
+    started isError ifTrue: [^started]
+    raw := MintHTTP1 bare: ((Erlang ssl) listen: 0 with: full)
+    raw isError ifTrue: [^raw]
+    self.useTls := true
+    self.lsock := MintTlsSocket handle: raw value
+    self resetState
+    named := MintHTTP1 bare: ((Erlang ssl) sockname: self.lsock handle)
+    named isError ifTrue: [^named]
+    {_addr, port} := named value
+    Result ok: port
+
+  /// Fresh per-connection state (tables, windows, recording).
+  resetState -> Nil =>
+    self.rest := Binary fromBytes: #()
+    self.decodeTable := HPACK newTable: 4096
+    self.encodeTable := HPACK newTable: 4096
+    self.handshakeDone := false
+    self.serverSettings := #{}
+    self.maxFrameOut := 16384
+    self.received := #()
+    nil
+
+  /// The `SETTINGS` payload the server sends at the handshake.
+  setServerSettings: params -> Nil =>
+    self.serverSettings := params
+    nil
+
+  /// Chunk fixture responses at `n` bytes (forces `CONTINUATION`s and
+  /// multi-`DATA` responses when small).
+  setMaxFrameOut: n :: Integer -> Nil =>
+    self.maxFrameOut := n
+    nil
+
+  /// Every frame tag received from the client so far.
+  receivedFrames -> List => self.received
+
+  /// Accept (and TLS-handshake) the next connection, storing it.
+  acceptNext -> Result(Nil, Object) =>
+    got := self ensureConn
+    got isError ifTrue: [^got]
+    Result ok: nil
+
+  /// Serve one request on the connection (accepting and handshaking
+  /// first) and answer `Result ok:` its `{streamId, target, headers,
+  /// body}`. The response follows `spec`: `{#resp, status, headers,
+  /// body}` or `#echo` (the request body, status 200).
+  serveNext: spec -> Result(Tuple, Object) =>
+    got := self ensureConn
+    got isError ifTrue: [^got]
+    hs := self ensureHandshake
+    hs isError ifTrue: [^hs]
+    self serveRequest: spec
+
+  /// Read one request and write the spec'd response, answering
+  /// `Result ok:` `{streamId, target, headers, body}`.
+  serveRequest: spec -> Result(Tuple, Object) =>
+    req := self readRequest
+    req isError ifTrue: [^req]
+    sid := req value at: 1
+    target := req value at: 2
+    headers := req value at: 3
+    body := req value at: 4
+    wrote := self
+      respond: spec
+      stream: sid
+      headers: headers
+      body: body
+    wrote isError ifTrue: [^wrote]
+    Result ok: {sid, target, headers, body}
+
+  /// Send a `PING` (payload `1..8`), then serve one request. The
+  /// client acknowledgement lands in `receivedFrames` as
+  /// `{#ping, true, payload}`.
+  pingThenServe: spec -> Result(Tuple, Object) =>
+    got := self ensureConn
+    got isError ifTrue: [^got]
+    hs := self ensureHandshake
+    hs isError ifTrue: [^hs]
+    sent := self
+      sendRaw: ((MintH2Frame
+        header: 8
+        type: 6
+        flags: 0
+        streamId: 0) concat: (Binary fromBytes: #(1, 2, 3, 4, 5, 6, 7, 8)))
+    sent isError ifTrue: [^sent]
+    self serveRequest: spec
+
+  /// Send a `GOAWAY`, then serve one request (open streams still
+  /// complete; the client just refuses new ones afterwards).
+  goawayThenServe: lastId spec: spec -> Result(Tuple, Object) =>
+    got := self ensureConn
+    got isError ifTrue: [^got]
+    hs := self ensureHandshake
+    hs isError ifTrue: [^hs]
+    sent := self sendRaw: (MintH2Frame goaway: lastId code: 0)
+    sent isError ifTrue: [^sent]
+    self serveRequest: spec
+
+  /// Serve one request asynchronously (for stalled-body tests, where
+  /// the test must pump the client while the server waits for
+  /// `END_STREAM`). Fire-and-forget: the test asserts on the response
+  /// parts its own `stream:` collects.
+  serveNextAsync: spec -> Nil =>
+    self serveNext: spec
+    nil
+
+  /// Read one more raw frame (recording it for `receivedFrames`)
+  /// and answer it — for assertions on frames the client sent after
+  /// the last `serveNext:` returned (e.g. `WINDOW_UPDATE`s).
+  pollFrame -> Result(Object, Object) => self readRawFrame
+
+  /// Close the connection and listener (best effort).
+  shutdown -> Nil =>
+    self.conn isNil ifFalse: [self.conn close]
+    self.conn := nil
+    self.lsock isNil ifFalse: [self.lsock close]
+    self.lsock := nil
+    nil
+
+  /// The active connection, accepting (and handshaking) when needed.
+  ensureConn -> Result(Dynamic, Object) =>
+    self.conn isNil ifFalse: [^Result ok: self.conn]
+    acc := self.useTls
+      ifTrue: [
+        MintHTTP1 bare: ((Erlang ssl) transport_accept: self.lsock handle timeout: 5000)
+      ]
+      ifFalse: [
+        MintHTTP1 bare: ((Erlang gen_tcp) accept: self.lsock handle timeout: 5000)
+      ]
+    acc isError ifTrue: [^acc]
+    raw := acc value
+    self.useTls
+      ifTrue: [
+        hs := MintHTTP1 bare: ((Erlang ssl) handshake: raw)
+        hs isError ifTrue: [^hs]
+        raw := hs value
+      ]
+    sock := self.useTls ifTrue: [
+      MintTlsSocket handle: raw
+    ] ifFalse: [MintTcpSocket handle: raw]
+    self.conn := sock
+    Result ok: sock
+
+  /// Accept the next connection and run the server side of the
+  /// handshake. Call asynchronously (`acceptHandshake!`) *before* the
+  /// client connects: the client handshake blocks until the server
+  /// answers, and the server handshake blocks until the client preface
+  /// arrives, so neither side may run first.
+  acceptHandshake -> Result(Nil, Object) =>
+    got := self ensureConn
+    got isError ifTrue: [^got]
+    self ensureHandshake
+
+  /// Run the server side of the handshake once: read the preface and
+  /// client `SETTINGS`, acknowledge them, send server `SETTINGS`, read
+  /// the client ACK. Raw reads only — the auto-answering `readFrame`
+  /// would ACK the client `SETTINGS` and then block waiting for more.
+  ensureHandshake -> Result(Nil, Object) =>
+    self.handshakeDone ifTrue: [^Result ok: nil]
+    magic := self takeExactly: (MintH2Frame preface size)
+    magic isError ifTrue: [^magic]
+    (magic value =:= MintH2Frame preface) ifFalse: [
+      ^Result error: "bad client preface"
+    ]
+    first := self readRawFrame
+    first isError ifTrue: [^first]
+    ((first value at: 1) =:= #settings) ifFalse: [
+      ^Result error: "expected client SETTINGS"
+    ]
+    self applyClientSettings: (first value at: 2)
+    sent := self sendRaw: MintH2Frame settingsAck
+    sent isError ifTrue: [^sent]
+    sent := self sendRaw: (MintH2Frame settings: self.serverSettings)
+    sent isError ifTrue: [^sent]
+    ack := self readRawFrame
+    ack isError ifTrue: [^ack]
+    (ack value =:= #settingsAck) ifFalse: [
+      ^Result error: "expected client SETTINGS ack"
+    ]
+    self.handshakeDone := true
+    Result ok: nil
+
+  /// Apply the client's `SETTINGS` to the send side (the frame cap
+  /// for everything the fixture emits; windows stay at the defaults
+  /// the client always advertises — it sends empty `SETTINGS`).
+  applyClientSettings: params -> Nil =>
+    max := params at: #max_frame_size ifAbsent: [nil]
+    max isNil ifFalse: [self.maxFrameOut := max]
+    nil
+
+  /// Record a received frame tag for `receivedFrames` assertions.
+  record: tag -> Nil =>
+    self.received := self.received ++ #(tag)
+    nil
+
+  // ===== Frame IO =====
+
+  /// Read one raw client frame, pumping `recv` as needed. Answers
+  /// `Result ok:` the parsed frame with no side effects beyond
+  /// recording (see `noteFrame:`): connection-level frames are NOT
+  /// answered here, so handshake and request loops stay in control.
+  readRawFrame -> Result(Object, Object) =>
+    parsed := MintH2Frame parse: self.rest maxFrame: 16384
+    parsed =:= #more
+      ifTrue: [
+        chunk := self.conn recv: 5000
+        chunk isError ifTrue: [^chunk]
+        self.rest := self.rest concat: chunk value
+        ^self readRawFrame
+      ]
+    (parsed at: 1) =:= #error ifTrue: [^Result error: (parsed at: 2)]
+    self.rest := parsed at: 3
+    frame := parsed at: 2
+    self noteFrame: frame
+    Result ok: frame
+
+  /// Read one stream-level frame: connection-level frames (`SETTINGS`
+  /// acked, `PING` acked, `WINDOW_UPDATE`/`GOAWAY`/unknown skipped) are
+  /// answered or dropped inline and the next frame is read.
+  readFrame -> Result(Object, Object) =>
+    raw := self readRawFrame
+    raw isError ifTrue: [^raw]
+    frame := raw value
+    frame =:= #settingsAck ifTrue: [^self readFrame]
+    tag := frame at: 1
+    tag =:= #settings
+      ifTrue: [
+        sent := self sendRaw: MintH2Frame settingsAck
+        sent isError ifTrue: [^sent]
+        ^self readFrame
+      ]
+    (tag =:= #settingsAck or: [tag =:= #windowUpdate]) ifTrue: [^self readFrame]
+    tag =:= #ping
+      ifTrue: [
+        (frame at: 2)
+          ifFalse: [
+            sent := self sendRaw: (MintH2Frame pingAck: (frame at: 3))
+            sent isError ifTrue: [^sent]
+          ]
+        ^self readFrame
+      ]
+    (tag =:= #goaway or: [tag =:= #unknown]) ifTrue: [^self readFrame]
+    Result ok: frame
+
+  /// Record the incoming frame for assertions and replenish the
+  /// receive windows after `DATA` (the fixture never lets its windows
+  /// run dry). A bare `#settingsAck` Symbol carries no stream id.
+  noteFrame: frame -> Nil =>
+    frame =:= #settingsAck ifTrue: [^self record: #settingsAck]
+    tag := frame at: 1
+    tag =:= #settings ifTrue: [^self record: {#settings, false}]
+    tag =:= #settingsAck ifTrue: [^self record: #settingsAck]
+    tag =:= #ping ifTrue: [^self record: {#ping, (frame at: 2), (frame at: 3)}]
+    tag =:= #windowUpdate ifTrue: [
+      ^self record: {#windowUpdate, (frame at: 2), (frame at: 3)}
+    ]
+    tag =:= #goaway ifTrue: [^self record: {#goaway, (frame at: 2)}]
+    tag =:= #headers ifTrue: [^self record: {#headers, (frame at: 2)}]
+    tag =:= #continuation ifTrue: [^self record: {#continuation, (frame at: 2)}]
+    tag =:= #data ifTrue: [^self recordData: frame]
+    tag =:= #rstStream ifTrue: [
+      ^self record: {#rstStream, (frame at: 2), (frame at: 3)}
+    ]
+    self record: {#unknown, tag}
+
+  /// Record incoming `DATA` and top the windows back up (an empty
+  /// `DATA` needs no grant — a zero increment is a connection error).
+  recordData: frame -> Nil =>
+    len := (frame at: 4) size
+    self record: {#data, (frame at: 2), len}
+    len =:= 0 ifTrue: [^nil]
+    self sendRaw: (MintH2Frame windowUpdate: 0 increment: len)
+    self sendRaw: (MintH2Frame windowUpdate: (frame at: 2) increment: len)
+    nil
+
+  /// Read exactly `n` bytes, pumping `recv` as needed.
+  takeExactly: n :: Integer -> Result(Binary, Object) =>
+    (self.rest size >= n)
+      ifTrue: [
+        bytes := self.rest part: 0 size: n
+        self.rest := self.rest part: n size: (self.rest size - n)
+        ^Result ok: bytes
+      ]
+    chunk := self.conn recv: 5000
+    chunk isError ifTrue: [^chunk]
+    self.rest := self.rest concat: chunk value
+    self takeExactly: n
+
+  /// Send bytes on the connection (best effort is not an option here:
+  /// fixture send failures fail the test).
+  sendRaw: bytes -> Result(Nil, Object) =>
+    sent := self.conn send: bytes
+    sent isError ifTrue: [^sent]
+    Result ok: nil
+
+  // ===== Request reading =====
+
+  /// Read one request: `{streamId, target, headers, body}`. `headers`
+  /// are `MintHeader`s (pseudo-headers split out); `target` is the
+  /// `:path` value.
+  readRequest -> Result(Tuple, Object) =>
+    self
+      readBlock: nil
+      stream: nil
+      head: nil
+      body: (Binary fromBytes: #())
+
+  /// Accumulate a header block (`frag`, nil when none) plus body until
+  /// `END_STREAM` arrives on a fresh stream. `head` holds the decoded
+  /// `{target, headers}` once the block is complete.
+  readBlock: frag stream: sid head: head body: body -> Result(Tuple, Object) =>
+    frame := self readFrame
+    frame isError ifTrue: [^frame]
+    tag := frame value at: 1
+    tag =:= #headers
+      ifTrue: [
+        ^self
+          readHeaders: frame value
+          frag: frag
+          stream: sid
+          head: head
+          body: body
+      ]
+    tag =:= #continuation
+      ifTrue: [
+        ^self
+          readContinuation: frame value
+          frag: frag
+          stream: sid
+          head: head
+          body: body
+      ]
+    tag =:= #data
+      ifTrue: [
+        ^self
+          readData: frame value
+          frag: frag
+          stream: sid
+          head: head
+          body: body
+      ]
+    tag =:= #rstStream ifTrue: [^Result error: "client reset stream"]
+    self
+      readBlock: frag
+      stream: sid
+      head: head
+      body: body
+
+  /// A HEADERS frame starts (or continues, illegally) a header block.
+  readHeaders: frame frag: frag stream: sid head: head body: body -> Result(Tuple, Object) =>
+    fsid := frame at: 2
+    endStream := frame at: 3
+    endHeaders := frame at: 4
+    piece := frame at: 5
+    sid isNil ifFalse: [
+      fsid =:= sid ifFalse: [^Result error: "interleaved streams unsupported"]
+    ]
+    frag isNil ifFalse: [^Result error: "HEADERS while header block continues"]
+    full := frag isNil ifTrue: [piece] ifFalse: [frag concat: piece]
+    endHeaders
+      ifTrue: [
+        ^self
+          finishHeaders: full
+          stream: fsid
+          head: head
+          body: body
+          endStream: endStream
+      ]
+      ifFalse: [
+        ^self
+          readBlock: full
+          stream: fsid
+          head: head
+          body: body
+      ]
+
+  /// A CONTINUATION frame extends the in-progress header block.
+  readContinuation: frame frag: frag stream: sid head: head body: body -> Result(Tuple, Object) =>
+    fsid := frame at: 2
+    endHeaders := frame at: 3
+    piece := frame at: 4
+    sid isNil ifFalse: [
+      fsid =:= sid ifFalse: [^Result error: "interleaved streams unsupported"]
+    ]
+    frag isNil ifTrue: [^Result error: "CONTINUATION without header block"]
+    full := frag concat: piece
+    endHeaders
+      ifTrue: [
+        ^self
+          finishHeaders: full
+          stream: sid
+          head: head
+          body: body
+          endStream: false
+      ]
+      ifFalse: [
+        ^self
+          readBlock: full
+          stream: sid
+          head: head
+          body: body
+      ]
+
+  /// Decode a complete header block; a request without `END_STREAM`
+  /// keeps reading its body.
+  finishHeaders: frag stream: sid head: head body: body endStream: endStream -> Result(Tuple, Object) =>
+    head isNil ifFalse: [^Result error: "HEADERS after header block"]
+    decoded := HPACK decode: frag table: self.decodeTable
+    (decoded at: 1) =:= #error ifTrue: [^Result error: "HPACK decode failed"]
+    self.decodeTable := decoded at: 3
+    split := self splitRequest: (decoded at: 2)
+    split isError ifTrue: [^split]
+    headPair := {(split value at: 1), (split value at: 2)}
+    endStream ifTrue: [
+      ^Result ok: {sid, (split value at: 1), (split value at: 2), body}
+    ]
+    self
+      readBlock: nil
+      stream: sid
+      head: headPair
+      body: body
+
+  /// A DATA frame appends to the body (windows were already topped up
+  /// in `recordData:`).
+  readData: frame frag: frag stream: sid head: head body: body -> Result(Tuple, Object) =>
+    fsid := frame at: 2
+    endStream := frame at: 3
+    bytes := frame at: 4
+    sid isNil ifTrue: [^Result error: "DATA before headers"]
+    fsid =:= sid ifFalse: [^Result error: "interleaved streams unsupported"]
+    grown := body concat: bytes
+    endStream
+      ifTrue: [
+        head isNil ifTrue: [^Result error: "request ended without headers"]
+        ^Result ok: {sid, (head at: 1), (head at: 2), grown}
+      ]
+      ifFalse: [
+        ^self
+          readBlock: frag
+          stream: sid
+          head: head
+          body: grown
+      ]
+
+  /// Split decoded pairs into `{target, headers}` (`:path` plus
+  /// `MintHeader`s, skipping the other pseudo-headers).
+  splitRequest: pairs -> Result(Tuple, Object) =>
+    target := nil
+    out := #()
+    1
+      to: pairs size
+      do: [:i |
+        pair := pairs at: i
+        name := (pair at: 1) asStringUnchecked
+        value := pair at: 2
+        (name startsWith: ":")
+          ifTrue: [name =:= ":path" ifTrue: [target := value asStringUnchecked]]
+          ifFalse: [
+            out := out
+              ++ #((MintHeader name: name lowercase value: (MintHTTP1 stringOrOpaque: value)))
+          ]
+      ]
+    target isNil ifTrue: [^Result error: "missing :path"]
+    Result ok: {target, out}
+
+  // ===== Responding =====
+
+  /// Write the spec'd response on `sid`: `{#resp, status, headers,
+  /// body}` (headers are `"name: value"` lines), `#echo` (the request
+  /// body, status 200), `{#rst, code}` (a `RST_STREAM` instead of a
+  /// response), `{#dataFirst, body}` (`DATA` before any `HEADERS` —
+  /// a protocol violation, for client-error tests), `{#push}` (a
+  /// `PUSH_PROMISE`, also a violation), or `{#respInterim, interim,
+  /// status, headers, body}` (a `1xx` block before the final one).
+  respond: spec stream: sid :: Integer headers: _headers body: body -> Result(Nil, Object) =>
+    spec =:= #echo
+      ifTrue: [
+        ^self
+          sendResponse: 200
+          headers: #()
+          body: body
+          stream: sid
+      ]
+    (spec isKindOf: Tuple) ifFalse: [^Result error: "bad response spec"]
+    tag := spec at: 1
+    tag =:= #rst ifTrue: [
+      ^self sendRaw: (MintH2Frame rstStream: sid code: (spec at: 2))
+    ]
+    tag =:= #dataFirst
+      ifTrue: [
+        sent := self
+          sendRaw: (MintH2Frame
+            datas: sid
+            bytes: (Binary fromIolist: (spec at: 2))
+            maxFrame: self.maxFrameOut)
+        sent isError ifTrue: [^sent]
+        ^self sendRaw: (MintH2Frame dataEnd: sid)
+      ]
+    tag =:= #push
+      ifTrue: [
+        ^self
+          sendRaw: ((MintH2Frame
+            header: 4
+            type: 5
+            flags: 0
+            streamId: 2) concat: (Binary fromBytes: #(0, 0, 0, 1)))
+      ]
+    tag =:= #respInterim
+      ifTrue: [
+        sent := self
+          sendHeaders: (spec at: 2)
+          headers: #()
+          endStream: false
+          stream: sid
+        sent isError ifTrue: [^sent]
+        ^self
+          sendResponse: (spec at: 3)
+          headers: (spec at: 4)
+          body: (Binary fromIolist: (spec at: 5))
+          stream: sid
+      ]
+    tag =:= #resp
+      ifTrue: [
+        ^self
+          sendResponse: (spec at: 2)
+          headers: (spec at: 3)
+          body: (Binary fromIolist: (spec at: 4))
+          stream: sid
+      ]
+    Result error: "bad response spec"
+
+  /// HPACK-encode `:status` plus headers and send HEADERS (+
+  /// CONTINUATIONs) on `sid`, chunked at `maxFrameOut`.
+  sendHeaders: status :: Integer headers: headers endStream: endStream stream: sid :: Integer -> Result(Nil, Object) =>
+    pairs := #({(Binary fromIolist: ":status"), (Binary fromIolist: status printString)})
+    1
+      to: headers size
+      do: [:i |
+        parsed := MintHTTP1 parseHeader: (Binary fromIolist: (headers at: i))
+        parsed isError ifTrue: [^parsed]
+        header := parsed value
+        value := header value
+        pairs := pairs
+          ++ #({(Binary fromIolist: header name), ((value isKindOf: Binary) ifTrue: [
+            value
+          ] ifFalse: [Binary fromIolist: value])})
+      ]
+    {io, enc} := HPACK
+      encode: #no_store
+      headers: pairs
+      table: self.encodeTable
+    self.encodeTable := enc
+    fragment := Binary fromIolist: io
+    self
+      sendRaw: (MintH2Frame
+        headers: sid
+        endStream: endStream
+        fragment: fragment
+        maxFrame: self.maxFrameOut)
+
+  /// Send HEADERS (+ CONTINUATIONs) and DATA on `sid`, chunked at
+  /// `maxFrameOut`.
+  sendResponse: status :: Integer headers: headers body: body :: Binary stream: sid :: Integer -> Result(Nil, Object) =>
+    sent := self
+      sendHeaders: status
+      headers: headers
+      endStream: (body size =:= 0)
+      stream: sid
+    sent isError ifTrue: [^sent]
+    body size =:= 0 ifTrue: [^Result ok: nil]
+    sent := self
+      sendRaw: (MintH2Frame
+        datas: sid
+        bytes: body
+        maxFrame: self.maxFrameOut)
+    sent isError ifTrue: [^sent]
+    self sendRaw: (MintH2Frame dataEnd: sid)
+
+  /// Send one `WINDOW_UPDATE`, then serve one request (for
+  /// flow-control overflow tests: the client must die on it).
+  windowUpdateThenServe: increment spec: spec -> Result(Tuple, Object) =>
+    got := self ensureConn
+    got isError ifTrue: [^got]
+    hs := self ensureHandshake
+    hs isError ifTrue: [^hs]
+    sent := self sendRaw: (MintH2Frame windowUpdate: 0 increment: increment)
+    sent isError ifTrue: [^sent]
+    self serveRequest: spec

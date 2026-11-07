@@ -1,0 +1,501 @@
+// Copyright 2026 mint authors
+// SPDX-License-Identifier: Apache-2.0
+
+/// MintH2Frame — the HTTP/2 frame codec for `MintHTTP2` (RFC 9113 §6).
+///
+/// A stateless `Object` namespace: parsing answers tagged Tuples,
+/// serializing takes tagged Tuples (or explicit arguments) and answers
+/// wire `Binary`. Frames the client never emits (priority handling,
+/// padding) are still *parsed*, so any server can be spoken to; frames
+/// the client never accepts (`PUSH_PROMISE`) are connection errors.
+///
+/// ## Frame shapes
+///
+/// - `{#data, sid, endStream, bytes}`
+/// - `{#headers, sid, endStream, endHeaders, fragment}`
+/// - `{#continuation, sid, endHeaders, fragment}`
+/// - `{#settings, params}` — `params` maps setting Symbols
+///   (`#header_table_size`, `#enable_push`, `#max_concurrent_streams`,
+///   `#initial_window_size`, `#max_frame_size`, `#max_header_list_size`)
+///   to Integers
+/// - `{#settingsAck}`
+/// - `{#ping, ack, payload}` — `payload` is 8 bytes
+/// - `{#goaway, lastStreamId, errorCode}`
+/// - `{#windowUpdate, sid, increment}`
+/// - `{#rstStream, sid, errorCode}`
+/// - `{#unknown, type, flags, sid, payload}`
+///
+/// `parse:buffer maxFrame:max` answers `{#ok, frame, rest}` (rest is the
+/// bytes past the frame), `{#more}` (need more bytes), or
+/// `{#error, message}` (the connection is unusable — send `GOAWAY` and
+/// drop it, as `MintHTTP2` does).
+sealed typed Object subclass: MintH2Frame
+
+  // ===== Constants =====
+
+  /// The client connection preface (RFC 9113 §3.4).
+  class sealed preface -> Binary =>
+    (Binary fromIolist: "PRI * HTTP/2.0") concat: (Binary fromBytes: #(13, 10, 13, 10, 83, 77, 13, 10, 13, 10))
+
+  /// The default flow-control window (RFC 9113 §6.9.2).
+  class sealed defaultWindow -> Integer => 65535
+
+  /// The default maximum frame payload the client accepts (RFC 9113 §6.5.2).
+  class sealed defaultMaxFrame -> Integer => 16384
+
+  /// `GOAWAY`/`RST_STREAM` code: no error.
+  class sealed noError -> Integer => 0
+
+  /// `GOAWAY`/`RST_STREAM` code: generic protocol error.
+  class sealed protocolError -> Integer => 1
+
+  /// `GOAWAY`/`RST_STREAM` code: flow-control limits breached.
+  class sealed flowControlError -> Integer => 3
+
+  /// `GOAWAY`/`RST_STREAM` code: a frame size limit breached.
+  class sealed frameSizeError -> Integer => 6
+
+  /// `GOAWAY` code: HPACK decoding failed (RFC 9113 §5.4.1).
+  class sealed compressionError -> Integer => 9
+
+  /// Whether bit `b` of `flags` is set.
+  class sealed flagSet: flags :: Integer bit: b :: Integer -> Boolean =>
+    (flags bitAnd: (1 bitShift: b)) =:= 0 ifTrue: [^false]
+    true
+
+  // ===== Parsing =====
+
+  /// Parse one frame from the head of `buffer`: `{#ok, frame, rest}`,
+  /// `{#more}`, or `{#error, message}`. `max` caps the accepted payload
+  /// size (the client's advertised `max_frame_size`).
+  class sealed parse: buffer :: Binary maxFrame: max :: Integer -> Tuple =>
+    (buffer size < 9) ifTrue: [^#more]
+    buffer match: [
+      <<length:24, type:8, flags:8, _reserved:1, sid:31, rest/binary>> -> self
+        parseBody: rest
+        length: length
+        type: type
+        flags: flags
+        sid: sid
+        maxFrame: max;
+      _ -> {#error, "malformed frame header"}
+    ]
+
+  /// Split the payload off `rest` and dispatch on the frame type.
+  class sealed parseBody: rest :: Binary length: length :: Integer type: type :: Integer flags: flags :: Integer sid: sid :: Integer maxFrame: max :: Integer -> Tuple =>
+    (rest size < length) ifTrue: [^#more]
+    length > max ifTrue: [^{#error, "frame payload exceeds max_frame_size"}]
+    payload := rest part: 0 size: length
+    tail := rest part: length size: (rest size - length)
+    framed := self
+      dispatch: type
+      flags: flags
+      sid: sid
+      payload: payload
+    (framed at: 1) =:= #error ifTrue: [^framed]
+    {#ok, framed at: 2, tail}
+
+  /// Dispatch a fully-buffered payload on its type, answering
+  /// `{#ok, frame}` or `{#error, message}`.
+  class sealed dispatch: type :: Integer flags: flags :: Integer sid: sid :: Integer payload: payload :: Binary -> Tuple =>
+    type match: [
+      0 -> self
+        data: flags
+        sid: sid
+        payload: payload;
+      1 -> self
+        headers: flags
+        sid: sid
+        payload: payload;
+      2 -> self
+        priority: flags
+        sid: sid
+        payload: payload;
+      3 -> self
+        rstStream: flags
+        sid: sid
+        payload: payload;
+      4 -> self
+        settings: flags
+        sid: sid
+        payload: payload;
+      5 -> {#error, "PUSH_PROMISE frame received"};
+      6 -> self
+        ping: flags
+        sid: sid
+        payload: payload;
+      7 -> self
+        goaway: flags
+        sid: sid
+        payload: payload;
+      8 -> self
+        windowUpdate: flags
+        sid: sid
+        payload: payload;
+      9 -> self
+        continuation: flags
+        sid: sid
+        payload: payload;
+      _ -> {#ok, {#unknown, type, flags, sid, payload}}
+    ]
+
+  /// A DATA frame: stream 0 and short payloads are connection errors.
+  class sealed data: flags :: Integer sid: sid :: Integer payload: payload :: Binary -> Tuple =>
+    sid =:= 0 ifTrue: [^{#error, "DATA frame with zero stream_id"}]
+    (self flagSet: flags bit: 3)
+      ifTrue: [
+        ^self
+          paddedData: flags
+          sid: sid
+          payload: payload
+      ]
+    {#ok, {#data, sid, (self flagSet: flags bit: 0), payload}}
+
+  /// A padded DATA frame: strip the pad-length byte and trailing padding.
+  class sealed paddedData: flags :: Integer sid: sid :: Integer payload: payload :: Binary -> Tuple =>
+    payload size =:= 0 ifTrue: [
+      ^{#error, "DATA frame with insufficient padding data"}
+    ]
+    payload match: [
+      <<padLength:8, body/binary>> -> body size >= padLength
+        ifTrue: [
+          {#ok, {#data, sid, (self flagSet: flags bit: 0), (body part: 0 size: (body size - padLength))}}
+        ]
+        ifFalse: [{#error, "DATA frame with invalid padding length"}];
+      _ -> {#error, "DATA frame with insufficient padding data"}
+    ]
+
+  /// A HEADERS frame: stream 0 is a connection error; priority data is
+  /// skipped (the client never prioritizes).
+  class sealed headers: flags :: Integer sid: sid :: Integer payload: payload :: Binary -> Tuple =>
+    sid =:= 0 ifTrue: [^{#error, "HEADERS frame with zero stream_id"}]
+    endStream := self flagSet: flags bit: 0
+    endHeaders := self flagSet: flags bit: 2
+    padded := self flagSet: flags bit: 3
+    hasPriority := self flagSet: flags bit: 5
+    padded
+      ifTrue: [
+        ^self
+          paddedHeaders: flags
+          sid: sid
+          endStream: endStream
+          endHeaders: endHeaders
+          hasPriority: hasPriority
+          payload: payload
+      ]
+    hasPriority
+      ifTrue: [
+        ^self
+          priorityHeaders: endStream
+          endHeaders: endHeaders
+          payload: payload
+          sid: sid
+      ]
+    {#ok, {#headers, sid, endStream, endHeaders, payload}}
+
+  /// Strip padding, then optional priority data, from a HEADERS payload.
+  class sealed paddedHeaders: _flags :: Integer sid: sid :: Integer endStream: endStream :: Boolean endHeaders: endHeaders :: Boolean hasPriority: hasPriority :: Boolean payload: payload :: Binary -> Tuple =>
+    payload size =:= 0 ifTrue: [
+      ^{#error, "HEADERS frame with insufficient data for its flags"}
+    ]
+    payload match: [
+      <<padLength:8, body/binary>> -> body size >= padLength
+        ifTrue: [
+          inner := body part: 0 size: (body size - padLength)
+          hasPriority
+            ifTrue: [
+              ^self
+                priorityHeaders: endStream
+                endHeaders: endHeaders
+                payload: inner
+                sid: sid
+            ]
+            ifFalse: [^{#ok, {#headers, sid, endStream, endHeaders, inner}}]
+        ]
+        ifFalse: [{#error, "HEADERS frame with invalid padding length"}];
+      _ -> {#error, "HEADERS frame with insufficient data for its flags"}
+    ]
+
+  /// Skip the 5 priority bytes of a HEADERS payload.
+  class sealed priorityHeaders: endStream :: Boolean endHeaders: endHeaders :: Boolean payload: payload :: Binary sid: sid :: Integer -> Tuple =>
+    payload match: [
+      <<_exclusive:1, _dependency:31, _weight:8, fragment/binary>> -> {#ok, {#headers, sid, endStream, endHeaders, fragment}};
+      _ -> {#error, "HEADERS frame with insufficient data for its flags"}
+    ]
+
+  /// A PRIORITY frame: parsed and ignored (answers `#unknown` with its
+  /// type, so the connection layer just drops it).
+  class sealed priority: flags :: Integer sid: sid :: Integer payload: payload :: Binary -> Tuple =>
+    sid =:= 0 ifTrue: [^{#error, "PRIORITY frame with zero stream_id"}]
+    payload match: [
+      <<_reserved:1, _dep:31, _weight:8>> -> {#ok, {#unknown, 2, flags, sid, payload}};
+      _ -> {#error, "Invalid payload size in PRIORITY frame"}
+    ]
+
+  /// A RST_STREAM frame: stream 0 and short payloads are errors.
+  class sealed rstStream: _flags :: Integer sid: sid :: Integer payload: payload :: Binary -> Tuple =>
+    sid =:= 0 ifTrue: [^{#error, "RST_STREAM frame with zero stream_id"}]
+    payload match: [
+      <<code:32>> -> {#ok, {#rstStream, sid, code}};
+      _ -> {#error, "Invalid payload size in RST_STREAM frame"}
+    ]
+
+  /// A SETTINGS frame: stream 0 only; an ACK must be empty; parameters
+  /// parse into the params dictionary (unknown ids are ignored).
+  class sealed settings: flags :: Integer sid: sid :: Integer payload: payload :: Binary -> Tuple =>
+    sid =:= 0 ifFalse: [^{#error, "Invalid SETTINGS frame"}]
+    ack := self flagSet: flags bit: 0
+    ack
+      ifTrue: [
+        payload size =:= 0 ifTrue: [
+          ^{#ok, #settingsAck}
+        ] ifFalse: [^{#error, "SETTINGS ack frame with non-empty payload"}]
+      ]
+      ifFalse: [self settingsParams: payload acc: #{}]
+
+  /// Parse 6-byte setting entries into `acc`.
+  class sealed settingsParams: payload :: Binary acc: acc :: Dictionary(Symbol, Object) -> Tuple =>
+    payload size =:= 0 ifTrue: [^{#ok, {#settings, acc}}]
+    payload match: [
+      <<id:16, value:32, rest/binary>> -> self
+        settingParam: id
+        value: value
+        rest: rest
+        acc: acc;
+      _ -> {#error, "Invalid SETTINGS size"}
+    ]
+
+  /// Fold one setting entry into `acc` (unknown ids ignored).
+  class sealed settingParam: id :: Integer value: value :: Integer rest: rest :: Binary acc: acc :: Dictionary(Symbol, Object) -> Tuple =>
+    id match: [
+      1 -> self settingsParams: rest acc: (acc at: #header_table_size put: value);
+      2 -> (value =:= 0 or: [
+        value =:= 1
+      ]) ifTrue: [
+        self settingsParams: rest acc: acc
+      ] ifFalse: [{#error, "Invalid enable_push value"}];
+      3 -> self settingsParams: rest acc: (acc at: #max_concurrent_streams put: value);
+      4 -> value > 2147483647 ifTrue: [
+        {#error, "Invalid window_size"}
+      ] ifFalse: [
+        self settingsParams: rest acc: (acc at: #initial_window_size put: value)
+      ];
+      5 -> (value < 16384 or: [
+        value > 16777215
+      ]) ifTrue: [
+        {#error, "Invalid max_frame_size"}
+      ] ifFalse: [
+        self settingsParams: rest acc: (acc at: #max_frame_size put: value)
+      ];
+      6 -> self settingsParams: rest acc: (acc at: #max_header_list_size put: value);
+      _ -> self settingsParams: rest acc: acc
+    ]
+
+  /// A PING frame: 8-byte payloads only, stream 0 only.
+  class sealed ping: flags :: Integer sid: sid :: Integer payload: payload :: Binary -> Tuple =>
+    sid =:= 0 ifFalse: [^{#error, "Invalid stream ID in PING frame"}]
+    payload size =:= 8 ifTrue: [
+      ^{#ok, {#ping, (self flagSet: flags bit: 0), payload}}
+    ] ifFalse: [^{#error, "PING frame with invalid payload size"}]
+
+  /// A GOAWAY frame: stream 0 only.
+  class sealed goaway: _flags :: Integer sid: sid :: Integer payload: payload :: Binary -> Tuple =>
+    sid =:= 0 ifFalse: [^{#error, "Invalid stream ID in GOAWAY frame"}]
+    payload match: [
+      <<_reserved:1, last:31, code:32, _debug/binary>> -> {#ok, {#goaway, last, code}};
+      _ -> {#error, "Invalid payload size in GOAWAY frame"}
+    ]
+
+  /// A WINDOW_UPDATE frame: zero increments are connection errors.
+  class sealed windowUpdate: _flags :: Integer sid: sid :: Integer payload: payload :: Binary -> Tuple =>
+    payload match: [
+      <<_reserved:1, 0:31>> -> {#error, "Invalid WINDOW_UPDATE size increment"};
+      <<_r:1, inc:31>> -> {#ok, {#windowUpdate, sid, inc}};
+      _ -> {#error, "Invalid WINDOW_UPDATE frame"}
+    ]
+
+  /// A CONTINUATION frame: stream 0 is a connection error.
+  class sealed continuation: flags :: Integer sid: sid :: Integer payload: payload :: Binary -> Tuple =>
+    sid =:= 0 ifTrue: [^{#error, "CONTINUATION frame with zero stream_id"}]
+    {#ok, {#continuation, sid, (self flagSet: flags bit: 2), payload}}
+
+  // ===== Serializing =====
+
+  /// The 9-byte frame header.
+  class sealed header: length :: Integer type: type :: Integer flags: flags :: Integer streamId: sid :: Integer -> Binary =>
+    Binary fromBytes: #((length bitShift: -16) bitAnd: 255, (length bitShift: -8) bitAnd: 255, length bitAnd: 255, type, flags, (sid bitShift: -24) bitAnd: 127, (sid bitShift: -16) bitAnd: 255, (sid bitShift: -8) bitAnd: 255, sid bitAnd: 255)
+
+  /// A 16-bit big-endian integer.
+  class sealed bytes16: n :: Integer -> Binary =>
+    Binary fromBytes: #((n bitShift: -8) bitAnd: 255, n bitAnd: 255)
+
+  /// A 32-bit big-endian integer.
+  class sealed bytes32: n :: Integer -> Binary =>
+    Binary fromBytes: #((n bitShift: -24) bitAnd: 255, (n bitShift: -16) bitAnd: 255, (n bitShift: -8) bitAnd: 255, n bitAnd: 255)
+
+  /// A 31-bit big-endian integer (the top bit cleared).
+  class sealed bytes31: n :: Integer -> Binary =>
+    self bytes32: (n bitAnd: 2147483647)
+
+  /// The next chunk size for a `size`-byte payload capped at `max`.
+  class sealed chunkOf: size :: Integer max: max :: Integer -> Integer =>
+    size <= max ifTrue: [^size]
+    max
+
+  /// An empty SETTINGS frame (all defaults: the client never tunes what
+  /// it receives in v1 — its tables and windows start at the defaults).
+  class sealed emptySettings -> Binary =>
+    self
+      header: 0
+      type: 4
+      flags: 0
+      streamId: 0
+
+  /// A SETTINGS frame from `params` (setting Symbols to Integers;
+  /// defaults are still written out explicitly).
+  class sealed settings: params :: Dictionary(Symbol, Object) -> Binary =>
+    body := Binary fromBytes: #()
+    params keys do: [:key |
+      body := body concat: (self settingEntry: key value: (params at: key))
+    ]
+    (self
+      header: body size
+      type: 4
+      flags: 0
+      streamId: 0) concat: body
+
+  /// One 6-byte setting entry (unknown keys encode empty).
+  class sealed settingEntry: key :: Symbol value: value :: Object -> Binary =>
+    id := self settingId: key
+    id isNil ifTrue: [^Binary fromBytes: #()]
+    (value isKindOf: Integer) ifFalse: [^Binary fromBytes: #()]
+    (self bytes16: id) concat: (self bytes32: value)
+
+  /// A setting Symbol's wire id, or nil.
+  class sealed settingId: key :: Symbol -> Integer | Nil =>
+    key =:= #header_table_size ifTrue: [^1]
+    key =:= #enable_push ifTrue: [^2]
+    key =:= #max_concurrent_streams ifTrue: [^3]
+    key =:= #initial_window_size ifTrue: [^4]
+    key =:= #max_frame_size ifTrue: [^5]
+    key =:= #max_header_list_size ifTrue: [^6]
+    nil
+
+  /// A SETTINGS acknowledgement.
+  class sealed settingsAck -> Binary =>
+    self
+      header: 0
+      type: 4
+      flags: 1
+      streamId: 0
+
+  /// HEADERS (+ CONTINUATIONs) for `fragment` on `sid`: the first
+  /// `max`-byte chunk goes in HEADERS, the rest in CONTINUATIONs, and
+  /// only the last frame carries `END_HEADERS`. `endStream` rides on the
+  /// HEADERS frame.
+  class sealed headers: sid :: Integer endStream: endStream :: Boolean fragment: fragment :: Binary maxFrame: max :: Integer -> Binary =>
+    first := fragment part: 0 size: (self chunkOf: fragment size max: max)
+    endFlag := endStream ifTrue: [1] ifFalse: [0]
+    rest := fragment part: first size size: (fragment size - first size)
+    rest size =:= 0
+      ifTrue: [
+        ^(self
+          header: first size
+          type: 1
+          flags: endFlag + 4
+          streamId: sid) concat: first
+      ]
+    head := (self
+      header: first size
+      type: 1
+      flags: endFlag
+      streamId: sid) concat: first
+    head
+      concat: (self
+        continuations: sid
+        fragment: rest
+        maxFrame: max)
+
+  /// CONTINUATION frames for `fragment`: all but the last carry no flags.
+  class sealed continuations: sid :: Integer fragment: fragment :: Binary maxFrame: max :: Integer -> Binary =>
+    first := fragment part: 0 size: (self chunkOf: fragment size max: max)
+    rest := fragment part: first size size: (fragment size - first size)
+    rest size =:= 0
+      ifTrue: [
+        ^(self
+          header: first size
+          type: 9
+          flags: 4
+          streamId: sid) concat: first
+      ]
+    head := (self
+      header: first size
+      type: 9
+      flags: 0
+      streamId: sid) concat: first
+    head
+      concat: (self
+        continuations: sid
+        fragment: rest
+        maxFrame: max)
+
+  /// DATA frames for `bytes` on `sid`, chunked at `max` bytes (no
+  /// `END_STREAM` — the caller appends it by sending a final empty DATA
+  /// or setting the flag through `dataEnd:`).
+  class sealed datas: sid :: Integer bytes: bytes :: Binary maxFrame: max :: Integer -> Binary =>
+    bytes size =:= 0 ifTrue: [^Binary fromBytes: #()]
+    first := bytes part: 0 size: (self chunkOf: bytes size max: max)
+    rest := bytes part: first size size: (bytes size - first size)
+    head := (self
+      header: first size
+      type: 0
+      flags: 0
+      streamId: sid) concat: first
+    rest size =:= 0 ifTrue: [^head]
+    head
+      concat: (self
+        datas: sid
+        bytes: rest
+        maxFrame: max)
+
+  /// A final empty DATA frame carrying `END_STREAM` on `sid`.
+  class sealed dataEnd: sid :: Integer -> Binary =>
+    self
+      header: 0
+      type: 0
+      flags: 1
+      streamId: sid
+
+  /// A PING acknowledgement for `payload`.
+  class sealed pingAck: payload :: Binary -> Binary =>
+    (self
+      header: 8
+      type: 6
+      flags: 1
+      streamId: 0) concat: payload
+
+  /// A WINDOW_UPDATE for `increment` on `sid` (0 is the connection).
+  class sealed windowUpdate: sid :: Integer increment: inc :: Integer -> Binary =>
+    (self
+      header: 4
+      type: 8
+      flags: 0
+      streamId: sid) concat: (self bytes31: inc)
+
+  /// A RST_STREAM frame with `code` on `sid`.
+  class sealed rstStream: sid :: Integer code: code :: Integer -> Binary =>
+    (self
+      header: 4
+      type: 3
+      flags: 0
+      streamId: sid) concat: (self bytes32: code)
+
+  /// A GOAWAY frame: `lastId` is the last stream the peer might have
+  /// processed, `code` the reason.
+  class sealed goaway: lastId :: Integer code: code :: Integer -> Binary =>
+    body := (self bytes31: lastId) concat: (self bytes32: code)
+    (self
+      header: body size
+      type: 7
+      flags: 0
+      streamId: 0) concat: body
