@@ -19,7 +19,7 @@ Actor subclass: MintTestServer
     raw := MintHTTP1 bare: ((Erlang gen_tcp) listen: 0 with: #(#binary, {#packet, #raw}, {#active, false}, {#reuseaddr, true}, {#ip, {127, 0, 0, 1}}))
     raw isError ifTrue: [^raw]
     self.useTls := false
-    self.lsock := MintSocket transport: #tcp handle: raw value
+    self.lsock := MintTcpSocket handle: raw value
     self boundPort: self.lsock handle
 
   /// Bind loopback port 0 over TLS (`alpn` is the advertised list, or
@@ -38,7 +38,7 @@ Actor subclass: MintTestServer
     raw := MintHTTP1 bare: ((Erlang ssl) listen: 0 with: full)
     raw isError ifTrue: [^raw]
     self.useTls := true
-    self.lsock := MintSocket transport: #tls handle: raw value
+    self.lsock := MintTlsSocket handle: raw value
     named := MintHTTP1 bare: ((Erlang ssl) sockname: self.lsock handle)
     named isError ifTrue: [^named]
     {_addr, port} := named value
@@ -107,9 +107,9 @@ Actor subclass: MintTestServer
         hs isError ifTrue: [^hs]
         raw := hs value
       ]
-    sock := MintSocket transport: (self.useTls ifTrue: [
-      #tls
-    ] ifFalse: [#tcp]) handle: raw
+    sock := self.useTls ifTrue: [
+      MintTlsSocket handle: raw
+    ] ifFalse: [MintTcpSocket handle: raw]
     self.conn := sock
     Result ok: sock
 

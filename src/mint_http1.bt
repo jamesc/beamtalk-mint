@@ -128,8 +128,8 @@ sealed typed Value subclass: MintHTTP1
     timeout := self timeoutOf: opts
     ip := self resolve: host
     ip isError ifTrue: [^ip]
-    sock := MintSocket
-      connectTcp: ip value
+    sock := MintTcpSocket
+      connect: ip value
       port: port
       opts: #(#binary, {#packet, #raw}, {#active, false})
       timeout: timeout
@@ -164,8 +164,8 @@ sealed typed Value subclass: MintHTTP1
       ifFalse: [
         #(#binary, {#packet, #raw}, {#active, false}, {#verify, verify}, {#alpn_advertised_protocols, alpn}, {#server_name_indication, sni})
       ]
-    sock := MintSocket
-      connectTls: ip value
+    sock := MintTlsSocket
+      connect: ip value
       port: port
       opts: rawOpts
       timeout: timeout
