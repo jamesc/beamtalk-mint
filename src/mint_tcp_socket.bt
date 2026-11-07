@@ -16,7 +16,7 @@ sealed typed Value subclass: MintTcpSocket
     raw isError ifTrue: [^Result error: raw error]
     Result ok: (MintTcpSocket handle: raw value)
 
-  send: bytes :: TextOrBytes -> Result(Nil, Object) =>
+  send: bytes :: String | Binary -> Result(Nil, Object) =>
     MintHTTP1 bare: ((Erlang gen_tcp) send: self handle with: bytes)
 
   recv: ms :: Integer -> Result(Binary, Object) =>

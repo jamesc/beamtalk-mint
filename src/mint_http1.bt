@@ -221,7 +221,7 @@ sealed typed Value subclass: MintHTTP1
   /// A test-only connection over a preset byte buffer with no socket:
   /// `stream` parses from the buffer, and reads past its end answer a
   /// truncation error instead of touching the network.
-  class sealed buffered: bytes :: TextOrBytes -> MintHTTP1 =>
+  class sealed buffered: bytes :: String | Binary -> MintHTTP1 =>
     MintHTTP1
       socket: nil
       transport: #tcp
@@ -269,7 +269,7 @@ sealed typed Value subclass: MintHTTP1
   /// passes through as opaque Binary. Written era-proof across the
   /// BT-4170 `asString` flip (bare String, then `Result`): every
   /// shape is handled.
-  class sealed stringOrOpaque: bin :: Binary -> TextOrBytes =>
+  class sealed stringOrOpaque: bin :: Binary -> String | Binary =>
     bin asString match: [
       s :: String -> s;
       r :: Result -> r isError ifTrue: [bin] ifFalse: [r value];
@@ -373,7 +373,7 @@ sealed typed Value subclass: MintHTTP1
     self parseHex: trimmed
 
   /// Parse a non-empty decimal digit string. Anything else is an error.
-  class sealed parseDecimal: text :: TextOrBytes -> Result(Integer, Object) =>
+  class sealed parseDecimal: text :: String | Binary -> Result(Integer, Object) =>
     (text bitSize div: 8) =:= 0 ifTrue: [^Result error: "empty integer"]
     value := 0
     1
@@ -389,7 +389,7 @@ sealed typed Value subclass: MintHTTP1
     Result ok: value
 
   /// Parse a non-empty hexadecimal digit string. Anything else errors.
-  class sealed parseHex: text :: TextOrBytes -> Result(Integer, Object) =>
+  class sealed parseHex: text :: String | Binary -> Result(Integer, Object) =>
     (text bitSize div: 8) =:= 0 ifTrue: [^Result error: "empty integer"]
     value := 0
     1
@@ -436,7 +436,7 @@ sealed typed Value subclass: MintHTTP1
   ///   text); `host` and `content-length` are filled in when missing.
   /// - `body` — a String or Binary (empty sends `content-length: 0`,
   ///   keeping framing unambiguous).
-  request: method :: String target: target :: String headers: headers :: List(String) body: body :: TextOrBytes -> Result(Tuple, Object) =>
+  request: method :: String target: target :: String headers: headers :: List(String) body: body :: String | Binary -> Result(Tuple, Object) =>
     self socket isNil ifTrue: [^Result error: #closed]
     self inFlightRef isNil ifFalse: [^Result error: #already_in_flight]
     upper := method uppercase
@@ -489,7 +489,7 @@ sealed typed Value subclass: MintHTTP1
   /// Send bytes on this connection's socket. A closed connection
   /// answers `#closed` (request: guards this first; the check keeps
   /// the socket provably non-nil for the checker).
-  send: bytes :: TextOrBytes -> Result(Nil, Object) =>
+  send: bytes :: String | Binary -> Result(Nil, Object) =>
     sock := self socket
     sock isNil ifTrue: [^Result error: #closed]
     sock send: bytes
