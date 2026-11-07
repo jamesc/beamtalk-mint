@@ -103,6 +103,11 @@ Actor subclass: MintH2TestServer
     got isError ifTrue: [^got]
     hs := self ensureHandshake
     hs isError ifTrue: [^hs]
+    self serveRequest: spec
+
+  /// Read one request and write the spec'd response, answering
+  /// `Result ok:` `{streamId, target, headers, body}`.
+  serveRequest: spec -> Result(Tuple, Object) =>
     req := self readRequest
     req isError ifTrue: [^req]
     sid := req value at: 1
@@ -116,6 +121,34 @@ Actor subclass: MintH2TestServer
       body: body
     wrote isError ifTrue: [^wrote]
     Result ok: {sid, target, headers, body}
+
+  /// Send a `PING` (payload `1..8`), then serve one request. The
+  /// client acknowledgement lands in `receivedFrames` as
+  /// `{#ping, true, payload}`.
+  pingThenServe: spec -> Result(Tuple, Object) =>
+    got := self ensureConn
+    got isError ifTrue: [^got]
+    hs := self ensureHandshake
+    hs isError ifTrue: [^hs]
+    sent := self
+      sendRaw: ((MintH2Frame
+        header: 8
+        type: 6
+        flags: 0
+        streamId: 0) concat: (Binary fromBytes: #(1, 2, 3, 4, 5, 6, 7, 8)))
+    sent isError ifTrue: [^sent]
+    self serveRequest: spec
+
+  /// Send a `GOAWAY`, then serve one request (open streams still
+  /// complete; the client just refuses new ones afterwards).
+  goawayThenServe: lastId spec: spec -> Result(Tuple, Object) =>
+    got := self ensureConn
+    got isError ifTrue: [^got]
+    hs := self ensureHandshake
+    hs isError ifTrue: [^hs]
+    sent := self sendRaw: (MintH2Frame goaway: lastId code: 0)
+    sent isError ifTrue: [^sent]
+    self serveRequest: spec
 
   /// Serve one request asynchronously (for stalled-body tests, where
   /// the test must pump the client while the server waits for
@@ -271,7 +304,7 @@ Actor subclass: MintH2TestServer
     tag := frame at: 1
     tag =:= #settings ifTrue: [^self record: {#settings, false}]
     tag =:= #settingsAck ifTrue: [^self record: #settingsAck]
-    tag =:= #ping ifTrue: [^self record: {#ping, (frame at: 2)}]
+    tag =:= #ping ifTrue: [^self record: {#ping, (frame at: 2), (frame at: 3)}]
     tag =:= #windowUpdate ifTrue: [
       ^self record: {#windowUpdate, (frame at: 2), (frame at: 3)}
     ]
@@ -373,17 +406,9 @@ Actor subclass: MintH2TestServer
     endStream := frame at: 3
     endHeaders := frame at: 4
     piece := frame at: 5
-    sid isNil
-      ifFalse: [
-        fsid =:= sid
-          ifFalse: [
-            ^self
-              readBlock: frag
-              stream: sid
-              head: head
-              body: body
-          ]
-      ]
+    sid isNil ifFalse: [
+      fsid =:= sid ifFalse: [^Result error: "interleaved streams unsupported"]
+    ]
     frag isNil ifFalse: [^Result error: "HEADERS while header block continues"]
     full := frag isNil ifTrue: [piece] ifFalse: [frag concat: piece]
     endHeaders
@@ -405,8 +430,12 @@ Actor subclass: MintH2TestServer
 
   /// A CONTINUATION frame extends the in-progress header block.
   readContinuation: frame frag: frag stream: sid head: head body: body -> Result(Tuple, Object) =>
+    fsid := frame at: 2
     endHeaders := frame at: 3
     piece := frame at: 4
+    sid isNil ifFalse: [
+      fsid =:= sid ifFalse: [^Result error: "interleaved streams unsupported"]
+    ]
     frag isNil ifTrue: [^Result error: "CONTINUATION without header block"]
     full := frag concat: piece
     endHeaders
@@ -452,14 +481,7 @@ Actor subclass: MintH2TestServer
     endStream := frame at: 3
     bytes := frame at: 4
     sid isNil ifTrue: [^Result error: "DATA before headers"]
-    fsid =:= sid
-      ifFalse: [
-        ^self
-          readBlock: frag
-          stream: sid
-          head: head
-          body: body
-      ]
+    fsid =:= sid ifFalse: [^Result error: "interleaved streams unsupported"]
     grown := body concat: bytes
     endStream
       ifTrue: [
@@ -498,7 +520,12 @@ Actor subclass: MintH2TestServer
   // ===== Responding =====
 
   /// Write the spec'd response on `sid`: `{#resp, status, headers,
-  /// body}` (headers are `"name: value"` lines) or `#echo`.
+  /// body}` (headers are `"name: value"` lines), `#echo` (the request
+  /// body, status 200), `{#rst, code}` (a `RST_STREAM` instead of a
+  /// response), `{#dataFirst, body}` (`DATA` before any `HEADERS` —
+  /// a protocol violation, for client-error tests), `{#push}` (a
+  /// `PUSH_PROMISE`, also a violation), or `{#respInterim, interim,
+  /// status, headers, body}` (a `1xx` block before the final one).
   respond: spec stream: sid :: Integer headers: _headers body: body -> Result(Nil, Object) =>
     spec =:= #echo
       ifTrue: [
@@ -510,6 +537,42 @@ Actor subclass: MintH2TestServer
       ]
     (spec isKindOf: Tuple) ifFalse: [^Result error: "bad response spec"]
     tag := spec at: 1
+    tag =:= #rst ifTrue: [
+      ^self sendRaw: (MintH2Frame rstStream: sid code: (spec at: 2))
+    ]
+    tag =:= #dataFirst
+      ifTrue: [
+        sent := self
+          sendRaw: (MintH2Frame
+            datas: sid
+            bytes: (Binary fromIolist: (spec at: 2))
+            maxFrame: self.maxFrameOut)
+        sent isError ifTrue: [^sent]
+        ^self sendRaw: (MintH2Frame dataEnd: sid)
+      ]
+    tag =:= #push
+      ifTrue: [
+        ^self
+          sendRaw: ((MintH2Frame
+            header: 4
+            type: 5
+            flags: 0
+            streamId: 2) concat: (Binary fromBytes: #(0, 0, 0, 1)))
+      ]
+    tag =:= #respInterim
+      ifTrue: [
+        sent := self
+          sendHeaders: (spec at: 2)
+          headers: #()
+          endStream: false
+          stream: sid
+        sent isError ifTrue: [^sent]
+        ^self
+          sendResponse: (spec at: 3)
+          headers: (spec at: 4)
+          body: (Binary fromIolist: (spec at: 5))
+          stream: sid
+      ]
     tag =:= #resp
       ifTrue: [
         ^self
@@ -521,8 +584,8 @@ Actor subclass: MintH2TestServer
     Result error: "bad response spec"
 
   /// HPACK-encode `:status` plus headers and send HEADERS (+
-  /// CONTINUATIONs) and DATA on `sid`, chunked at `maxFrameOut`.
-  sendResponse: status :: Integer headers: headers body: body :: Binary stream: sid :: Integer -> Result(Nil, Object) =>
+  /// CONTINUATIONs) on `sid`, chunked at `maxFrameOut`.
+  sendHeaders: status :: Integer headers: headers endStream: endStream stream: sid :: Integer -> Result(Nil, Object) =>
     pairs := #({(Binary fromIolist: ":status"), (Binary fromIolist: status printString)})
     1
       to: headers size
@@ -542,12 +605,21 @@ Actor subclass: MintH2TestServer
       table: self.encodeTable
     self.encodeTable := enc
     fragment := Binary fromIolist: io
-    sent := self
+    self
       sendRaw: (MintH2Frame
         headers: sid
-        endStream: (body size =:= 0)
+        endStream: endStream
         fragment: fragment
         maxFrame: self.maxFrameOut)
+
+  /// Send HEADERS (+ CONTINUATIONs) and DATA on `sid`, chunked at
+  /// `maxFrameOut`.
+  sendResponse: status :: Integer headers: headers body: body :: Binary stream: sid :: Integer -> Result(Nil, Object) =>
+    sent := self
+      sendHeaders: status
+      headers: headers
+      endStream: (body size =:= 0)
+      stream: sid
     sent isError ifTrue: [^sent]
     body size =:= 0 ifTrue: [^Result ok: nil]
     sent := self
@@ -557,3 +629,14 @@ Actor subclass: MintH2TestServer
         maxFrame: self.maxFrameOut)
     sent isError ifTrue: [^sent]
     self sendRaw: (MintH2Frame dataEnd: sid)
+
+  /// Send one `WINDOW_UPDATE`, then serve one request (for
+  /// flow-control overflow tests: the client must die on it).
+  windowUpdateThenServe: increment spec: spec -> Result(Tuple, Object) =>
+    got := self ensureConn
+    got isError ifTrue: [^got]
+    hs := self ensureHandshake
+    hs isError ifTrue: [^hs]
+    sent := self sendRaw: (MintH2Frame windowUpdate: 0 increment: increment)
+    sent isError ifTrue: [^sent]
+    self serveRequest: spec

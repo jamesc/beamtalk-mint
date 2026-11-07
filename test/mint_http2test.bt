@@ -152,6 +152,145 @@ TestCase subclass: MintHTTP2Test
     self assert: result error equals: #unknown_ref
     conn close
 
+  testResetStreamAnswersReset =>
+    conn := self connect
+    {live, ref} := (conn
+      request: "GET"
+      target: "/reset"
+      headers: #()
+      body: "") unwrap
+    (self.srv serveNext: {#rst, 8}) unwrap
+    result := live stream: ref timeout: 5000
+    self deny: result isOk
+    self assert: result error equals: {#reset, 8}
+    live close
+
+  testPingIsAcknowledged =>
+    conn := self connect
+    {live, ref} := (conn
+      request: "GET"
+      target: "/ping"
+      headers: #()
+      body: "") unwrap
+    (self.srv pingThenServe: {#resp, 200, #(), "hi"}) unwrap
+    {done, parts} := (live stream: ref timeout: 5000) unwrap
+    self assert: ((parts at: 1) at: 3) equals: 200
+    ack := (self.srv pollFrame) unwrap
+    self assert: ack equals: {#ping, true, (Binary fromBytes: #(1, 2, 3, 4, 5, 6, 7, 8))}
+    done close
+
+  testGoawayStopsNewRequests =>
+    conn := self connect
+    {live, ref} := (conn
+      request: "GET"
+      target: "/bye"
+      headers: #()
+      body: "") unwrap
+    (self.srv goawayThenServe: 1 spec: {#resp, 200, #(), "hi"}) unwrap
+    {done, parts} := (live stream: ref timeout: 5000) unwrap
+    self assert: ((parts at: 1) at: 3) equals: 200
+    self deny: done isOpen
+    refused := done
+      request: "GET"
+      target: "/late"
+      headers: #()
+      body: ""
+    self deny: refused isOk
+    self assert: refused error equals: #closed
+    done close
+
+  testGoawayRefusesFreshStreamFast =>
+    conn := self connect
+    {live, ref} := (conn
+      request: "GET"
+      target: "/gone"
+      headers: #()
+      body: "") unwrap
+    (self.srv goawayThenServe: 0 spec: {#resp, 200, #(), "hi"}) unwrap
+    result := live stream: ref timeout: 5000
+    self deny: result isOk
+    self assert: result error equals: #closed
+    live close
+
+  testSplitHeaderBlockWithEndStream =>
+    self.srv setMaxFrameOut: 16
+    headers := #("x-a: 1", "x-b: 2", "x-c: 3", "x-d: 4", "x-e: 5")
+    {done, parts} := self get: "/wide-empty" spec: {#resp, 200, headers, ""}
+    self assert: parts size equals: 3
+    self assert: ((parts at: 1) at: 3) equals: 200
+    self assert: ((parts at: 3) at: 1) equals: #done
+    done close
+
+  testDataBeforeHeadersDies =>
+    conn := self connect
+    {live, ref} := (conn
+      request: "GET"
+      target: "/data-first"
+      headers: #()
+      body: "") unwrap
+    (self.srv serveNext: {#dataFirst, "oops"}) unwrap
+    result := live stream: ref timeout: 5000
+    self deny: result isOk
+    self assert: result error equals: "DATA before response headers"
+    update := (self.srv pollFrame) unwrap
+    self assert: (update at: 1) equals: #goaway
+    live close
+
+  testWindowOverflowDies =>
+    conn := self connect
+    {live, ref} := (conn
+      request: "GET"
+      target: "/overflow"
+      headers: #()
+      body: "") unwrap
+    (self.srv windowUpdateThenServe: 2147483647 spec: {#resp, 200, #(), "hi"}) unwrap
+    result := live stream: ref timeout: 5000
+    self deny: result isOk
+    self assert: result error equals: "flow-control window exceeded"
+    update := (self.srv pollFrame) unwrap
+    self assert: (update at: 1) equals: #goaway
+    self assert: (update at: 3) equals: 3
+    live close
+
+  testPushPromiseDies =>
+    conn := self connect
+    {live, ref} := (conn
+      request: "GET"
+      target: "/push"
+      headers: #()
+      body: "") unwrap
+    (self.srv serveNext: {#push}) unwrap
+    result := live stream: ref timeout: 5000
+    self deny: result isOk
+    self assert: result error equals: "PUSH_PROMISE frame received"
+    update := (self.srv pollFrame) unwrap
+    self assert: (update at: 1) equals: #goaway
+    live close
+
+  testInterimThenFinal =>
+    conn := self connect
+    {live, ref} := (conn
+      request: "GET"
+      target: "/interim"
+      headers: #()
+      body: "") unwrap
+    (self.srv serveNext: {#respInterim, 103, 200, #(), "final"}) unwrap
+    {done, parts} := (live stream: ref timeout: 5000) unwrap
+    self assert: ((parts at: 1) at: 3) equals: 200
+    self assert: (self bodyOf: parts) equals: "final"
+    done close
+
+  testPseudoHeaderRejected =>
+    conn := self connect
+    result := conn
+      request: "GET"
+      target: "/evil"
+      headers: #(":path: /evil")
+      body: ""
+    self deny: result isOk
+    self assert: result error equals: "pseudo-headers are set by the client"
+    conn close
+
   testMaxConcurrentStreamsRefuses =>
     self.srv setServerSettings: #{#max_concurrent_streams => 1}
     conn := self connect
