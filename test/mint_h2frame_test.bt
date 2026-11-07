@@ -21,7 +21,10 @@ TestCase subclass: MintH2FrameTest
     self assert: rest size equals: 0
 
   testSettingsParamsRoundTrip =>
-    wire := MintH2Frame settings: #{#initial_window_size => 100, #max_frame_size => 32768}
+    wire := MintH2Frame settings: #{
+      #initial_window_size => 100,
+      #max_frame_size => 32768
+    }
     {tag, frame, rest} := self parse: wire
     self assert: tag equals: #ok
     self assert: (frame at: 1) equals: #settings
@@ -47,13 +50,22 @@ TestCase subclass: MintH2FrameTest
 
   testHeadersRoundTrip =>
     frag := Binary fromIolist: "fragment"
-    {tag, frame, _rest} := self parse: (MintH2Frame headers: 1 endStream: true fragment: frag maxFrame: 16384)
+    {tag, frame, _rest} := self
+      parse: (MintH2Frame
+        headers: 1
+        endStream: true
+        fragment: frag
+        maxFrame: 16384)
     self assert: tag equals: #ok
     self assert: frame equals: {#headers, 1, true, true, frag}
 
   testHeadersSplitIntoContinuations =>
     frag := Binary fromBytes: #(1, 2, 3, 4, 5, 6)
-    wire := MintH2Frame headers: 1 endStream: false fragment: frag maxFrame: 2
+    wire := MintH2Frame
+      headers: 1
+      endStream: false
+      fragment: frag
+      maxFrame: 2
     {tag, first, rest} := self parse: wire
     self assert: tag equals: #ok
     self assert: first equals: {#headers, 1, false, false, (Binary fromBytes: #(1, 2))}
@@ -66,13 +78,25 @@ TestCase subclass: MintH2FrameTest
     self assert: rest3 size equals: 0
 
   testDataRoundTrip =>
-    {tag, frame, _rest} := MintH2Frame parse: ((MintH2Frame headers: 1 endStream: false fragment: (Binary fromBytes: #(9)) maxFrame: 16384) concat: MintH2Frame settingsAck) maxFrame: 16384
+    {tag, frame, _rest} := MintH2Frame
+      parse: ((MintH2Frame
+        headers: 1
+        endStream: false
+        fragment: (Binary fromBytes: #(9))
+        maxFrame: 16384) concat: MintH2Frame settingsAck)
+      maxFrame: 16384
     self assert: tag equals: #ok
     self assert: frame equals: {#headers, 1, false, true, (Binary fromBytes: #(9))}
 
   testPingRoundTrip =>
     payload := Binary fromBytes: #(1, 2, 3, 4, 5, 6, 7, 8)
-    {tag, frame, _rest} := MintH2Frame parse: ((MintH2Frame header: 8 type: 6 flags: 0 streamId: 0) concat: payload) maxFrame: 16384
+    {tag, frame, _rest} := MintH2Frame
+      parse: ((MintH2Frame
+        header: 8
+        type: 6
+        flags: 0
+        streamId: 0) concat: payload)
+      maxFrame: 16384
     self assert: tag equals: #ok
     self assert: frame equals: {#ping, false, payload}
 
@@ -98,11 +122,21 @@ TestCase subclass: MintH2FrameTest
     self assert: frame equals: {#rstStream, 1, 8}
 
   testDataOnStreamZeroIsError =>
-    {tag, _frame} := self parse: (MintH2Frame header: 0 type: 0 flags: 1 streamId: 0)
+    {tag, _frame} := self
+      parse: (MintH2Frame
+        header: 0
+        type: 0
+        flags: 1
+        streamId: 0)
     self assert: tag equals: #error
 
   testPushPromiseIsError =>
-    {tag, _frame} := self parse: (MintH2Frame header: 0 type: 5 flags: 0 streamId: 2)
+    {tag, _frame} := self
+      parse: (MintH2Frame
+        header: 0
+        type: 5
+        flags: 0
+        streamId: 2)
     self assert: tag equals: #error
 
   testZeroWindowIncrementIsError =>
@@ -110,6 +144,10 @@ TestCase subclass: MintH2FrameTest
     self assert: tag equals: #error
 
   testOversizePayloadIsError =>
-    big := MintH2Frame headers: 1 endStream: true fragment: (Binary fromBytes: #(1, 2, 3)) maxFrame: 16384
+    big := MintH2Frame
+      headers: 1
+      endStream: true
+      fragment: (Binary fromBytes: #(1, 2, 3))
+      maxFrame: 16384
     {tag, _frame} := MintH2Frame parse: big maxFrame: 2
     self assert: tag equals: #error

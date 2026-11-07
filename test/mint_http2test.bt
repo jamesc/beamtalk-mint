@@ -1,0 +1,268 @@
+// Copyright 2026 mint authors
+// SPDX-License-Identifier: Apache-2.0
+
+/// `MintHTTP2` integration tests against `MintH2TestServer` (a raw
+/// loopback H2 peer, no dependencies): settings negotiation, a plain
+/// round-trip, concurrent multiplexed streams on one connection,
+/// flow-control windows in both directions, split header blocks, TLS
+/// with ALPN `h2`, and the request-side guards.
+TestCase subclass: MintHTTP2Test
+  field: srv = nil
+  field: port = 0
+
+  setUp =>
+    self.srv := MintH2TestServer spawn
+    self.port := (self.srv startPlain) unwrap
+    self
+
+  tearDown => self.srv isNil ifFalse: [self.srv shutdown]
+
+  connect =>
+    self.srv acceptHandshake!
+    (MintHTTP2 connect: "127.0.0.1" port: self.port) unwrap
+
+  get: target spec: spec =>
+    conn := self connect
+    {live, ref} := (conn
+      request: "GET"
+      target: target
+      headers: #()
+      body: "") unwrap
+    (self.srv serveNext: spec) unwrap
+    (live stream: ref timeout: 5000) unwrap
+
+  bodyOf: parts => ((parts at: 3) at: 3) asStringUnchecked
+
+  testGetRoundTrip =>
+    {done, parts} := self get: "/" spec: {#resp, 200, #("x-test: yes"), "hi"}
+    self assert: parts size equals: 4
+    self assert: ((parts at: 1) at: 1) equals: #status
+    self assert: ((parts at: 1) at: 3) equals: 200
+    self assert: ((parts at: 2) at: 1) equals: #headers
+    self assert: ((((parts at: 2) at: 3) at: 1) isKindOf: MintHeader)
+    self assert: ((((parts at: 2) at: 3) at: 1) name) equals: "x-test"
+    self assert: ((parts at: 3) at: 1) equals: #data
+    self assert: (self bodyOf: parts) equals: "hi"
+    self assert: ((parts at: 4) at: 1) equals: #done
+    self assert: ((parts at: 4) at: 2) equals: ((parts at: 1) at: 2)
+    self assert: done isOpen
+    self assert: done openRequestCount equals: 0
+    done close
+
+  testRefsAreClientStreamIds =>
+    conn := self connect
+    {live, one} := (conn
+      request: "GET"
+      target: "/a"
+      headers: #()
+      body: "") unwrap
+    self assert: one equals: 1
+    {live2, three} := (live
+      request: "GET"
+      target: "/b"
+      headers: #()
+      body: "") unwrap
+    self assert: three equals: 3
+    self assert: live2 openRequestCount equals: 2
+    (self.srv serveNext: {#resp, 200, #(), "a"}) unwrap
+    (self.srv serveNext: {#resp, 200, #(), "b"}) unwrap
+    {afterOne, first} := (live2 stream: one timeout: 5000) unwrap
+    self assert: (self bodyOf: first) equals: "a"
+    {done, second} := (afterOne stream: three timeout: 5000) unwrap
+    self assert: (self bodyOf: second) equals: "b"
+    done close
+
+  testConcurrentStreamsShareAConnection =>
+    conn := self connect
+    {c1, one} := (conn
+      request: "GET"
+      target: "/one"
+      headers: #()
+      body: "") unwrap
+    {c2, three} := (c1
+      request: "GET"
+      target: "/three"
+      headers: #()
+      body: "") unwrap
+    {live, five} := (c2
+      request: "GET"
+      target: "/five"
+      headers: #()
+      body: "") unwrap
+    self assert: live openRequestCount equals: 3
+    (self.srv serveNext: {#resp, 200, #(), "one"}) unwrap
+    (self.srv serveNext: {#resp, 200, #(), "three"}) unwrap
+    (self.srv serveNext: {#resp, 200, #(), "five"}) unwrap
+    {afterFive, partsFive} := (live stream: five timeout: 5000) unwrap
+    self assert: (self bodyOf: partsFive) equals: "five"
+    self assert: afterFive openRequestCount equals: 0
+    {afterOne, partsOne} := (afterFive stream: one timeout: 5000) unwrap
+    self assert: (self bodyOf: partsOne) equals: "one"
+    {done, partsThree} := (afterOne stream: three timeout: 5000) unwrap
+    self assert: (self bodyOf: partsThree) equals: "three"
+    self assert: done openRequestCount equals: 0
+    done close
+
+  testPostEchoesBody =>
+    conn := self connect
+    {live, ref} := (conn
+      request: "POST"
+      target: "/echo"
+      headers: #()
+      body: "beamtalk") unwrap
+    served := (self.srv serveNext: #echo) unwrap
+    {_ignored, parts} := (live stream: ref timeout: 5000) unwrap
+    self assert: (self bodyOf: parts) equals: "beamtalk"
+    self assert: ((parts at: 1) at: 3) equals: 200
+    self assert: (served at: 2) equals: "/echo"
+    self assert: ((served at: 4) asStringUnchecked) equals: "beamtalk"
+    live close
+
+  testRequestHeadersReachServer =>
+    conn := self connect
+    {live, ref} := (conn
+      request: "GET"
+      target: "/headers"
+      headers: #("x-echo: ping")
+      body: "") unwrap
+    served := (self.srv serveNext: {#resp, 200, #(), "ok"}) unwrap
+    {_ignored, parts} := (live stream: ref timeout: 5000) unwrap
+    self assert: ((parts at: 1) at: 3) equals: 200
+    seen := false
+    (served at: 3) do: [:h |
+      (h name =:= "x-echo" and: [h value =:= "ping"]) ifTrue: [seen := true]
+    ]
+    self assert: seen
+    live close
+
+  testEmpty204HasNoData =>
+    {_ignored, parts} := self get: "/empty204" spec: {#resp, 204, #(), ""}
+    self assert: ((parts at: 1) at: 3) equals: 204
+    self assert: parts size equals: 3
+
+  testNotFound =>
+    {_ignored, parts} := self get: "/missing" spec: {#resp, 404, #(), "nope"}
+    self assert: ((parts at: 1) at: 3) equals: 404
+    self assert: (self bodyOf: parts) equals: "nope"
+
+  testUnknownRefIsError =>
+    conn := self connect
+    result := conn stream: 99 timeout: 1000
+    self deny: result isOk
+    self assert: result error equals: #unknown_ref
+    conn close
+
+  testMaxConcurrentStreamsRefuses =>
+    self.srv setServerSettings: #{#max_concurrent_streams => 1}
+    conn := self connect
+    {live, one} := (conn
+      request: "GET"
+      target: "/a"
+      headers: #()
+      body: "") unwrap
+    refused := live
+      request: "GET"
+      target: "/b"
+      headers: #()
+      body: ""
+    self deny: refused isOk
+    self assert: refused error equals: #too_many_streams
+    (self.srv serveNext: {#resp, 200, #(), "a"}) unwrap
+    {_done, parts} := (live stream: one timeout: 5000) unwrap
+    self assert: (self bodyOf: parts) equals: "a"
+    live close
+
+  testSplitHeaderBlockReassembles =>
+    self.srv setMaxFrameOut: 16
+    headers := #("x-a: 1", "x-b: 2", "x-c: 3", "x-d: 4", "x-e: 5")
+    {_ignored, parts} := self get: "/wide" spec: {#resp, 200, headers, "hi"}
+    self assert: ((parts at: 1) at: 3) equals: 200
+    self assert: (self bodyOf: parts) equals: "hi"
+    got := (parts at: 2) at: 3
+    self assert: (got anySatisfy: [:h | h name =:= "x-a"])
+    self assert: (got anySatisfy: [:h | h name =:= "x-e"])
+
+  /// A doubling helper for big test bodies (logarithmic concats).
+  grow: bin times: n =>
+    n =:= 0 ifTrue: [^bin]
+    self grow: (bin concat: bin) times: n - 1
+
+  testBigDownloadSendsWindowUpdate =>
+    big := self grow: (Binary fromBytes: #(65)) times: 16
+    conn := self connect
+    {live, ref} := (conn
+      request: "GET"
+      target: "/big"
+      headers: #()
+      body: "") unwrap
+    (self.srv serveNext: {#resp, 200, #(), big}) unwrap
+    {done, parts} := (live stream: ref timeout: 10000) unwrap
+    self assert: (((parts at: 3) at: 3) size) equals: 65536
+    update := (self.srv pollFrame) unwrap
+    self assert: (update at: 1) equals: #windowUpdate
+    self assert: (update at: 2) equals: 0
+    done close
+
+  testSmallPeerWindowStallsAndResumes =>
+    self.srv setServerSettings: #{#initial_window_size => 100}
+    big := self grow: (Binary fromBytes: #(66)) times: 8
+    conn := self connect
+    {live, ref} := (conn
+      request: "POST"
+      target: "/echo"
+      headers: #()
+      body: big) unwrap
+    self.srv serveNextAsync: #echo!
+    {done, parts} := (live stream: ref timeout: 10000) unwrap
+    self assert: (((parts at: 3) at: 3) size) equals: 256
+    frames := self.srv receivedFrames
+    datas := #()
+    frames
+      do: [:tag |
+        (tag isKindOf: Tuple)
+          ifTrue: [
+            ((tag at: 1) =:= #data and: [
+              (tag at: 3) > 0
+            ]) ifTrue: [datas := datas ++ #(tag)]
+          ]
+      ]
+    self assert: datas size equals: 3
+    datas do: [:tag | self assert: ((tag at: 3) <= 100)]
+    done close
+
+  testTlsAlpnH2RoundTrip =>
+    server := MintH2TestServer spawn
+    port := (server
+      startTls: "test/fixtures/cert.pem"
+      keyfile: "test/fixtures/key.pem"
+      alpn: #("h2")) unwrap
+    server acceptHandshake!
+    conn := (MintHTTP2
+      connectTls: "127.0.0.1"
+      port: port
+      options: (Dictionary new)) unwrap
+    {live, ref} := (conn
+      request: "GET"
+      target: "/tls"
+      headers: #()
+      body: "") unwrap
+    (server serveNext: {#resp, 200, #(), "tls-hi"}) unwrap
+    {done, parts} := (live stream: ref timeout: 5000) unwrap
+    self assert: ((parts at: 1) at: 3) equals: 200
+    self assert: (((parts at: 3) at: 3) asStringUnchecked) equals: "tls-hi"
+    done close
+    server shutdown
+
+  testTlsWrongAlpnFails =>
+    server := MintH2TestServer spawn
+    port := (server
+      startTls: "test/fixtures/cert.pem"
+      keyfile: "test/fixtures/key.pem"
+      alpn: #("http/1.1")) unwrap
+    server acceptNext!
+    result := MintHTTP2
+      connectTls: "127.0.0.1"
+      port: port
+      options: (Dictionary new)
+    self deny: result isOk
+    server shutdown
