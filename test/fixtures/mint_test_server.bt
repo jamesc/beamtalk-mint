@@ -352,7 +352,7 @@ Actor subclass: MintTestServer
             ]) ifTrue: [framed := true]
           ]
       ]
-    (framed not and: [((body bitSize div: 8)) > 0])
+    (framed not and: [(body bitSize div: 8) > 0])
       ifTrue: [
         out := out ++ "content-length: " ++ (body bitSize div: 8) printString ++ MintHTTP1 crlf
       ]

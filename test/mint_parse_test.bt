@@ -251,13 +251,15 @@ TestCase subclass: MintParseTest
     self assert: conn openRequestCount equals: 1
 
   testAlpnMatchProceeds =>
-    self assert: (MintHTTP1 checkAlpn: (Result ok: "http/1.1") offered: #("http/1.1", "h2")) isOk
+    offered := MintHTTP1 alpnOf: #{#alpn => #("http/1.1", "h2")}
+    self assert: (MintHTTP1 checkAlpn: (Result ok: (Binary fromIolist: "http/1.1")) offered: offered) isOk
 
   testAlpnAbsentProceeds =>
     self assert: (MintHTTP1 checkAlpn: (Result error: #protocol_not_negotiated) offered: #("http/1.1")) isOk
 
   testAlpnMismatchIsError =>
-    result := MintHTTP1 checkAlpn: (Result ok: "h2") offered: #("http/1.1")
+    offered := MintHTTP1 alpnOf: #{#alpn => #("http/1.1")}
+    result := MintHTTP1 checkAlpn: (Result ok: (Binary fromIolist: "h2")) offered: offered
     self deny: result isOk
 
   testAlpnTransportErrorPropagates =>
