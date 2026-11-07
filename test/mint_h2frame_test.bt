@@ -1,0 +1,115 @@
+// Copyright 2026 mint authors
+// SPDX-License-Identifier: Apache-2.0
+
+/// Hermetic `MintH2Frame` tests: every frame type round-trips through
+/// `parse:`, partial buffers answer `#more`, and malformed frames answer
+/// `{#error, message}`.
+TestCase subclass: MintH2FrameTest
+
+  parse: bytes => MintH2Frame parse: bytes maxFrame: 16384
+
+  testEmptySettingsRoundTrip =>
+    {tag, frame, rest} := self parse: MintH2Frame emptySettings
+    self assert: tag equals: #ok
+    self assert: frame equals: {#settings, #{}}
+    self assert: rest size equals: 0
+
+  testSettingsAckRoundTrip =>
+    {tag, frame, rest} := self parse: MintH2Frame settingsAck
+    self assert: tag equals: #ok
+    self assert: frame equals: #settingsAck
+    self assert: rest size equals: 0
+
+  testSettingsParamsRoundTrip =>
+    wire := MintH2Frame settings: #{#initial_window_size => 100, #max_frame_size => 32768}
+    {tag, frame, rest} := self parse: wire
+    self assert: tag equals: #ok
+    self assert: (frame at: 1) equals: #settings
+    params := frame at: 2
+    self assert: (params at: #initial_window_size) equals: 100
+    self assert: (params at: #max_frame_size) equals: 32768
+    self assert: rest size equals: 0
+
+  testShortBufferIsMore =>
+    self assert: (self parse: (Binary fromBytes: #(0, 0))) equals: #more
+
+  testSplitHeaderIsMore =>
+    wire := MintH2Frame emptySettings
+    head := wire part: 0 size: 5
+    self assert: (self parse: head) equals: #more
+
+  testTrailingBytesStayBuffered =>
+    wire := (MintH2Frame dataEnd: 1) concat: (MintH2Frame dataEnd: 3)
+    {tag, frame, rest} := self parse: wire
+    self assert: tag equals: #ok
+    self assert: frame equals: {#data, 1, true, (Binary fromBytes: #())}
+    self assert: rest size equals: 9
+
+  testHeadersRoundTrip =>
+    frag := Binary fromIolist: "fragment"
+    {tag, frame, _rest} := self parse: (MintH2Frame headers: 1 endStream: true fragment: frag maxFrame: 16384)
+    self assert: tag equals: #ok
+    self assert: frame equals: {#headers, 1, true, true, frag}
+
+  testHeadersSplitIntoContinuations =>
+    frag := Binary fromBytes: #(1, 2, 3, 4, 5, 6)
+    wire := MintH2Frame headers: 1 endStream: false fragment: frag maxFrame: 2
+    {tag, first, rest} := self parse: wire
+    self assert: tag equals: #ok
+    self assert: first equals: {#headers, 1, false, false, (Binary fromBytes: #(1, 2))}
+    {tag2, second, rest2} := MintH2Frame parse: rest maxFrame: 16384
+    self assert: tag2 equals: #ok
+    self assert: second equals: {#continuation, 1, false, (Binary fromBytes: #(3, 4))}
+    {tag3, third, rest3} := MintH2Frame parse: rest2 maxFrame: 16384
+    self assert: tag3 equals: #ok
+    self assert: third equals: {#continuation, 1, true, (Binary fromBytes: #(5, 6))}
+    self assert: rest3 size equals: 0
+
+  testDataRoundTrip =>
+    {tag, frame, _rest} := MintH2Frame parse: ((MintH2Frame headers: 1 endStream: false fragment: (Binary fromBytes: #(9)) maxFrame: 16384) concat: MintH2Frame settingsAck) maxFrame: 16384
+    self assert: tag equals: #ok
+    self assert: frame equals: {#headers, 1, false, true, (Binary fromBytes: #(9))}
+
+  testPingRoundTrip =>
+    payload := Binary fromBytes: #(1, 2, 3, 4, 5, 6, 7, 8)
+    {tag, frame, _rest} := MintH2Frame parse: ((MintH2Frame header: 8 type: 6 flags: 0 streamId: 0) concat: payload) maxFrame: 16384
+    self assert: tag equals: #ok
+    self assert: frame equals: {#ping, false, payload}
+
+  testPingAckRoundTrip =>
+    payload := Binary fromBytes: #(8, 7, 6, 5, 4, 3, 2, 1)
+    {tag, frame, _rest} := MintH2Frame parse: (MintH2Frame pingAck: payload) maxFrame: 16384
+    self assert: tag equals: #ok
+    self assert: frame equals: {#ping, true, payload}
+
+  testWindowUpdateRoundTrip =>
+    {tag, frame, _rest} := MintH2Frame parse: (MintH2Frame windowUpdate: 0 increment: 1024) maxFrame: 16384
+    self assert: tag equals: #ok
+    self assert: frame equals: {#windowUpdate, 0, 1024}
+
+  testGoawayRoundTrip =>
+    {tag, frame, _rest} := MintH2Frame parse: (MintH2Frame goaway: 3 code: 0) maxFrame: 16384
+    self assert: tag equals: #ok
+    self assert: frame equals: {#goaway, 3, 0}
+
+  testRstStreamRoundTrip =>
+    {tag, frame, _rest} := MintH2Frame parse: (MintH2Frame rstStream: 1 code: 8) maxFrame: 16384
+    self assert: tag equals: #ok
+    self assert: frame equals: {#rstStream, 1, 8}
+
+  testDataOnStreamZeroIsError =>
+    {tag, _frame} := self parse: (MintH2Frame header: 0 type: 0 flags: 1 streamId: 0)
+    self assert: tag equals: #error
+
+  testPushPromiseIsError =>
+    {tag, _frame} := self parse: (MintH2Frame header: 0 type: 5 flags: 0 streamId: 2)
+    self assert: tag equals: #error
+
+  testZeroWindowIncrementIsError =>
+    {tag, _frame} := MintH2Frame parse: (MintH2Frame windowUpdate: 1 increment: 0) maxFrame: 16384
+    self assert: tag equals: #error
+
+  testOversizePayloadIsError =>
+    big := MintH2Frame headers: 1 endStream: true fragment: (Binary fromBytes: #(1, 2, 3)) maxFrame: 16384
+    {tag, _frame} := MintH2Frame parse: big maxFrame: 2
+    self assert: tag equals: #error
