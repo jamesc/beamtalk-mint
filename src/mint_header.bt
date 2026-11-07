@@ -9,4 +9,4 @@
 /// than decoding lossy).
 sealed typed Value subclass: MintHeader
   field: name :: String = ""
-  field: value :: String | Binary = ""
+  field: value :: TextOrBytes = ""

@@ -8,7 +8,7 @@
 /// `MintSocket`, so connection code never branches on transport.
 Protocol define: MintSocket
   /// Send bytes on this connection's socket.
-  send: bytes :: String | Binary -> Result(Nil, Object)
+  send: bytes :: TextOrBytes -> Result(Nil, Object)
   /// Receive available bytes (length 0: whatever has arrived).
   recv: ms :: Integer -> Result(Binary, Object)
   /// Close the socket, ignoring errors (best effort).

@@ -236,7 +236,7 @@ sealed typed Value subclass: MintHTTP2
 
   /// Send bytes, closing best effort on failure (the connection is
   /// unusable afterwards — drop it, as in `MintHTTP1`).
-  sendBytes: bytes :: String | Binary -> Result(MintHTTP2, Object) =>
+  sendBytes: bytes :: TextOrBytes -> Result(MintHTTP2, Object) =>
     sock := self socket
     sock isNil ifTrue: [^Result error: #closed]
     sent := sock send: bytes
@@ -336,7 +336,7 @@ sealed typed Value subclass: MintHTTP2
   ///   `END_STREAM`, not lengths).
   /// - `body` — a String or Binary (empty bodies ride on `HEADERS`
   ///   with `END_STREAM`; the rest streams as `DATA`).
-  request: method :: String target: target :: String headers: headers :: List(String) body: body :: String | Binary -> Result(Tuple, Object) =>
+  request: method :: String target: target :: String headers: headers :: List(String) body: body :: TextOrBytes -> Result(Tuple, Object) =>
     self socket isNil ifTrue: [^Result error: #closed]
     self goawayLastId isNil ifFalse: [^Result error: #closed]
     overLimit := self peerMaxStreams match: [
