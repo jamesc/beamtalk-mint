@@ -1,0 +1,19 @@
+// Copyright 2026 mint authors
+// SPDX-License-Identifier: Apache-2.0
+
+/// Leaf construction: the only untested lines in the transport
+/// layer (every send/receive/close runs through the integration
+/// tests on both leaves).
+TestCase subclass: MintSocketTest
+
+  testTcpWrapsHandle =>
+    sock := MintTcpSocket handle: nil
+    self assert: sock handle isNil
+
+  testTlsWrapsHandle =>
+    sock := MintTlsSocket handle: nil
+    self assert: sock handle isNil
+
+  testCloseNilHandleAnswersOk =>
+    sock := MintTcpSocket handle: nil
+    self assert: (sock close) isOk

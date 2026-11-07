@@ -1,0 +1,17 @@
+// Copyright 2026 mint authors
+// SPDX-License-Identifier: Apache-2.0
+
+/// The transport contract for a connected socket: sending,
+/// receiving, closing, and dialing. Conformance is structural —
+/// `MintTcpSocket` and `MintTlsSocket` answer these without
+/// declaring anything. `MintHTTP1` holds its socket as a
+/// `MintSocket`, so connection code never branches on transport.
+Protocol define: MintSocket
+  /// Send bytes on this connection's socket.
+  send: bytes :: String | Binary -> Result(Nil, Object)
+  /// Receive available bytes (length 0: whatever has arrived).
+  recv: ms :: Integer -> Result(Binary, Object)
+  /// Close the socket, ignoring errors (best effort).
+  close -> Result(Nil, Object)
+  /// Dial, answering the connected socket.
+  class connect: ip :: Dynamic port: port :: Integer opts: opts :: List(Object) timeout: ms :: Integer -> Self

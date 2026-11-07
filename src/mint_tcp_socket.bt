@@ -1,0 +1,34 @@
+// Copyright 2026 mint authors
+// SPDX-License-Identifier: Apache-2.0
+
+/// A cleartext `gen_tcp` socket. Conforms to `MintSocket`; see it
+/// for the contract.
+sealed typed Value subclass: MintTcpSocket
+  field: handle :: Object | Nil = nil
+
+  class connect: ip :: Dynamic port: port :: Integer opts: opts :: List(Object) timeout: ms :: Integer -> Result(MintTcpSocket, Object) =>
+    raw := MintHTTP1
+      bare: ((Erlang gen_tcp)
+        connect: ip
+        port: port
+        opts: opts
+        timeout: ms)
+    raw isError ifTrue: [^Result error: raw error]
+    Result ok: (MintTcpSocket handle: raw value)
+
+  send: bytes :: String | Binary -> Result(Nil, Object) =>
+    MintHTTP1 bare: ((Erlang gen_tcp) send: self handle with: bytes)
+
+  recv: ms :: Integer -> Result(Binary, Object) =>
+    raw := MintHTTP1
+      bare: ((Erlang gen_tcp)
+        recv: self handle
+        with: 0
+        with: ms)
+    raw isError ifTrue: [^Result error: raw error]
+    Result ok: raw value
+
+  close -> Result(Nil, Object) =>
+    self handle isNil ifTrue: [^Result ok: nil]
+    (Erlang gen_tcp) close: self handle
+    Result ok: nil
