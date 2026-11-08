@@ -105,15 +105,13 @@ sealed typed Value subclass: MintHTTP1
     Binary fromIolist: host
 
   /// The CRLF CRLF bytes ending a response head.
-  class sealed headTerminator -> Binary => Binary fromBytes: #(13, 10, 13, 10)
+  class sealed headTerminator -> Binary => Binary fromIolist: "\r\n\r\n"
 
   /// The CRLF bytes ending a response line.
-  class sealed lineTerminator -> Binary => Binary fromBytes: #(13, 10)
+  class sealed lineTerminator -> Binary => Binary fromIolist: "\r\n"
 
-  /// CRLF as text. String literals have no backslash escapes (a
-  /// `"\r\n"` literal is four characters), so wire text is built
-  /// from bytes instead of escapes.
-  class sealed crlf -> String => (Binary fromBytes: #(13, 10)) asStringUnchecked
+  /// CRLF as text (string escapes since ADR 0138).
+  class sealed crlf -> String => "\r\n"
 
   /// Open a cleartext connection. Answers `Result ok:` with the
   /// connected value, or `Result error:` with the Erlang reason.

@@ -17,8 +17,14 @@ TestCase subclass: MintParseTest
       method: method
       ref: ref) stream: ref timeout: 1000
 
-  /// Real CRLF text: string literals have no backslash escapes.
+  /// Real CRLF text (string escapes since ADR 0138).
   crlf => MintHTTP1 crlf
+
+  testWireTerminators =>
+    self assert: MintHTTP1 headTerminator equals: (Binary fromBytes: #(13, 10, 13, 10))
+    self assert: MintHTTP1 lineTerminator equals: (Binary fromBytes: #(13, 10))
+    self assert: MintHTTP1 crlf equals: "\r\n"
+    self assert: (MintHTTP1 crlf toBytes) equals: #(13, 10)
 
   testChunkedBodyWithExtensionAndTrailer =>
     raw := "HTTP/1.1 200 OK"
