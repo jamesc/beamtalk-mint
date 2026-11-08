@@ -179,6 +179,48 @@ TestCase subclass: MintHTTP2Test
     self assert: ack equals: {#ping, true, (Binary fromBytes: #(1, 2, 3, 4, 5, 6, 7, 8))}
     done close
 
+  testClientPingRoundTrip =>
+    conn := self connect
+    pinged := (conn ping: (Binary fromBytes: #(9, 9, 9, 9, 9, 9, 9, 9))) unwrap
+    {live, ref} := (pinged
+      request: "GET"
+      target: "/ping"
+      headers: #()
+      body: "") unwrap
+    (self.srv serveNext: {#resp, 200, #(), "hi"}) unwrap
+    {done, parts} := (live stream: ref timeout: 5000) unwrap
+    self assert: ((parts at: 1) at: 3) equals: 200
+    self
+      assert: (self.srv receivedFrames anySatisfy: [:f |
+        f =:= {#ping, false, (Binary fromBytes: #(9, 9, 9, 9, 9, 9, 9, 9))}
+      ])
+    done close
+
+  testClientPingRejectsShortPayload =>
+    conn := self connect
+    result := conn ping: (Binary fromBytes: #(1, 2, 3))
+    self deny: result isOk
+    conn close
+
+  testCancelDropsStream =>
+    conn := self connect
+    {live, ref} := (conn
+      request: "GET"
+      target: "/slow"
+      headers: #()
+      body: "") unwrap
+    cancelled := (live cancel: ref) unwrap
+    self assert: (cancelled stream: ref timeout: 1000) error equals: #unknown_ref
+    (self.srv pollFrame) unwrap
+    rst := (self.srv pollFrame) unwrap
+    self assert: rst equals: {#rstStream, ref, 8}
+    cancelled close
+
+  testCancelUnknownRef =>
+    conn := self connect
+    self assert: (conn cancel: 999) error equals: #unknown_ref
+    conn close
+
   testGoawayStopsNewRequests =>
     conn := self connect
     {live, ref} := (conn
