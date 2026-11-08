@@ -432,10 +432,11 @@ sealed typed Value subclass: MintHTTP2
 
   /// The `:authority` value: the host, plus the port when non-default.
   hostHeader -> String =>
+    host := MintHTTP1 bracketHost: self host
     default := self transport =:= #tls ifTrue: [443] ifFalse: [80]
     self port =:= default ifTrue: [
-      ^self host
-    ] ifFalse: [^self host ++ ":" ++ self port printString]
+      ^host
+    ] ifFalse: [^host ++ ":" ++ self port printString]
 
   /// Send as much of the stream's pending body as the connection and
   /// stream windows allow (capped at the peer's max frame size),

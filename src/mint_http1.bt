@@ -97,12 +97,12 @@ sealed typed Value subclass: MintHTTP1
 
   /// The SNI value for a DNS-name host, nil for an IP literal
   /// (SNI must not carry an IP: Erlang rejects it, and it stalls
-  /// ALPN handshakes against our test server). A raw Binary: a
-  /// tagged String never matches in Erlang comparisons.
-  class sealed sniOf: host :: String -> Binary | Nil =>
+  /// ALPN handshakes against our test server). A charlist: OTP
+  /// `ssl` rejects a Binary `server_name_indication`.
+  class sealed sniOf: host :: String -> List(Integer) | Nil =>
     parsed := MintHTTP1 bare: ((Erlang inet) parse_address: (host toBytes))
     parsed isOk ifTrue: [^nil]
-    Binary fromIolist: host
+    host asCharlist
 
   /// The CRLF CRLF bytes ending a response head.
   class sealed headTerminator -> Binary => Binary fromBytes: #(13, 10, 13, 10)
@@ -200,8 +200,14 @@ sealed typed Value subclass: MintHTTP1
   /// Resolve a hostname (or IP literal) to an address tuple for
   /// `gen_tcp`/`ssl`, which only take tuples from Beamtalk (a String
   /// host reaches them unusable). Answers `Result ok:` with the tuple.
+  /// IP literals short-circuit through `parse_address` (either
+  /// family); DNS names try IPv4 first, then IPv6.
   class sealed resolve: host :: String -> Result(Dynamic, Object) =>
-    MintHTTP1 bare: ((Erlang inet) getaddr: host toBytes with: #inet)
+    parsed := MintHTTP1 bare: ((Erlang inet) parse_address: (host toBytes))
+    parsed isOk ifTrue: [^parsed]
+    v4 := MintHTTP1 bare: ((Erlang inet) getaddr: host toBytes with: #inet)
+    v4 isOk ifTrue: [^v4]
+    MintHTTP1 bare: ((Erlang inet) getaddr: host toBytes with: #inet6)
 
   /// Check an ALPN outcome against the offered protocols. No
   /// negotiation (`#protocol_not_negotiated`, a server without ALPN)
@@ -410,6 +416,13 @@ sealed typed Value subclass: MintHTTP1
     (byte >= 97 and: [byte <= 102]) ifTrue: [^byte - 87]
     nil
 
+  /// The host, bracketed when it is an IPv6 literal (RFC 3986
+  /// `[::1]`): a bare `::1:port` in a `host` header or H2
+  /// `:authority` is rejected by strict servers. A reg-name or IPv4
+  /// literal passes through; detection is the presence of `:`.
+  class sealed bracketHost: host :: String -> String =>
+    (host includesSubstring: ":") ifTrue: ["[" ++ host ++ "]"] ifFalse: [host]
+
   /// Whether the connection can take another request.
   isOpen -> Boolean => self socket isNil not
 
@@ -481,10 +494,11 @@ sealed typed Value subclass: MintHTTP1
 
   /// The `host` header value: the host, plus the port when non-default.
   hostHeader -> String =>
+    host := MintHTTP1 bracketHost: self host
     default := self transport =:= #tls ifTrue: [443] ifFalse: [80]
     self port =:= default ifTrue: [
-      ^self host
-    ] ifFalse: [^self host ++ ":" ++ self port printString]
+      ^host
+    ] ifFalse: [^host ++ ":" ++ self port printString]
 
   /// Send bytes on this connection's socket. A closed connection
   /// answers `#closed` (request: guards this first; the check keeps
