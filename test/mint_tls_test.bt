@@ -80,5 +80,5 @@ TestCase subclass: MintTlsTest
   testSniOmittedForIpLiteral =>
     self assert: (MintHTTP1 sniOf: "127.0.0.1") isNil
 
-  testSniIsRawBinaryForDnsName =>
-    self assert: (MintHTTP1 sniOf: "example.com") equals: (Binary fromIolist: "example.com")
+  testSniIsCharlistForDnsName =>
+    self assert: (MintHTTP1 sniOf: "example.com") equals: "example.com" asCharlist

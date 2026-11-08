@@ -1,0 +1,42 @@
+// Copyright 2026 mint authors
+// SPDX-License-Identifier: Apache-2.0
+
+/// Hostname handling (BT-4539): IPv6-literal resolution, SNI as a
+/// charlist, and bracketed IPv6 hosts in `host` headers and H2
+/// `:authority`.
+TestCase subclass: MintHostnameTest
+
+  testResolveIpv6Literal =>
+    resolved := MintHTTP1 resolve: "::1"
+    self assert: resolved isOk
+
+  testResolveLocalhost =>
+    resolved := MintHTTP1 resolve: "localhost"
+    self assert: resolved isOk
+
+  testSniIsCharlistForDnsName =>
+    self assert: (MintHTTP1 sniOf: "example.com") equals: "example.com" asCharlist
+
+  testSniOmittedForIpv6Literal => self assert: (MintHTTP1 sniOf: "::1") isNil
+
+  testBracketHostLeavesRegNameAlone =>
+    self assert: (MintHTTP1 bracketHost: "example.com") equals: "example.com"
+
+  testBracketHostBracketsIpv6 =>
+    self assert: (MintHTTP1 bracketHost: "::1") equals: "[::1]"
+
+  testHostHeaderLeavesRegNameAlone =>
+    conn := (MintHTTP1 buffered: "") withHost: "example.com"
+    self assert: conn hostHeader equals: "example.com"
+
+  testHostHeaderRegNameWithPort =>
+    conn := ((MintHTTP1 buffered: "") withHost: "example.com") withPort: 8080
+    self assert: conn hostHeader equals: "example.com:8080"
+
+  testHostHeaderBracketsIpv6 =>
+    conn := (MintHTTP1 buffered: "") withHost: "::1"
+    self assert: conn hostHeader equals: "[::1]"
+
+  testHostHeaderBracketsIpv6WithPort =>
+    conn := ((MintHTTP1 buffered: "") withHost: "::1") withPort: 8080
+    self assert: conn hostHeader equals: "[::1]:8080"
