@@ -82,18 +82,21 @@ sealed typed Value subclass: MintHTTP1
     (raw isKindOf: Symbol) ifFalse: [Error signal: "verify must be a Symbol"]
     raw
 
-  /// The `#alpn` option as raw Binaries (Erlang compares them
-  /// against raw binaries; tagged Strings never match). The user
-  /// passes a List of Strings, default `defaultAlpn`.
-  class sealed alpnOf: opts :: Dictionary(Symbol, Object) -> List(Binary) =>
-    raw := opts at: #alpn ifAbsent: [
-      ^(self defaultAlpn collect: [:each | Binary fromIolist: each])
-    ]
+  /// The `#alpn` option as Strings, for `Tls clientOptions:alpn:`.
+  /// The user passes a List of Strings, default `defaultAlpn`.
+  class sealed alpnStringsOf: opts :: Dictionary(Symbol, Object) -> List(String) =>
+    raw := opts at: #alpn ifAbsent: [^self defaultAlpn]
     (raw isKindOf: List) ifFalse: [
       Error signal: "alpn must be a List of Strings"
     ]
     strings :: List(String) := raw
-    strings collect: [:each | Binary fromIolist: each]
+    strings
+
+  /// The `#alpn` option as raw Binaries (Erlang compares them
+  /// against raw binaries; tagged Strings never match). The user
+  /// passes a List of Strings, default `defaultAlpn`.
+  class sealed alpnOf: opts :: Dictionary(Symbol, Object) -> List(Binary) =>
+    (self alpnStringsOf: opts) collect: [:each | Binary fromIolist: each]
 
   /// The SNI value for a DNS-name host, nil for an IP literal
   /// (SNI must not carry an IP: Erlang rejects it, and it stalls
@@ -151,17 +154,17 @@ sealed typed Value subclass: MintHTTP1
   class sealed connectTls: host :: String port: port :: Integer options: opts :: Dictionary(Symbol, Object) -> Result(MintHTTP1, Object) =>
     timeout := self timeoutOf: opts
     verify := self verifyOf: opts
-    alpn := self alpnOf: opts
+    alpn := self alpnStringsOf: opts
     ip := self resolve: host
     ip isError ifTrue: [^ip]
-    sni := self sniOf: host
-    rawOpts := sni isNil
-      ifTrue: [
-        #(#binary, {#packet, #raw}, {#active, false}, {#verify, verify}, {#alpn_advertised_protocols, alpn})
-      ]
-      ifFalse: [
-        #(#binary, {#packet, #raw}, {#active, false}, {#verify, verify}, {#alpn_advertised_protocols, alpn}, {#server_name_indication, sni})
-      ]
+    // `Tls` owns the OTP-version compat, CA bundle, hostname check,
+    // and SNI omission for IP literals (BT-4551); `#verify_none`
+    // stays the default via `verifyOf:`, so behavior is unchanged.
+    @expect type
+    rawOpts :: List(Object) := Tls
+      clientOptions: host
+      alpn: alpn
+      verify: verify
     sock := MintTlsSocket
       connect: ip value
       port: port
