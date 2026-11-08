@@ -379,6 +379,29 @@ sealed typed Value subclass: MintHTTP2
     flushed isError ifTrue: [^flushed]
     Result ok: {flushed value, sid}
 
+  /// Send a `PING` carrying the 8-byte `payload` (keepalive / RTT):
+  /// the server's acknowledgement arrives as a normal frame and is
+  /// consumed by a later `stream:` pump. Answers `Result ok:` the
+  /// connection.
+  ping: payload :: Binary -> Result(MintHTTP2, Object) =>
+    payload size =:= 8 ifFalse: [^Result error: "PING payload must be 8 bytes"]
+    self
+      sendBytes: ((MintH2Frame
+        header: 8
+        type: 6
+        flags: 0
+        streamId: 0) concat: payload)
+
+  /// Cancel the in-flight stream `ref`: send `RST_STREAM` (code 8,
+  /// cancel) and drop its record, so a later `stream:` on `ref`
+  /// answers `#unknown_ref`. An unknown reference answers
+  /// `#unknown_ref` without touching the socket.
+  cancel: ref :: Integer -> Result(MintHTTP2, Object) =>
+    self streams at: ref ifAbsent: [^Result error: #unknown_ref]
+    sent := self sendBytes: (MintH2Frame rstStream: ref code: 8)
+    sent isError ifTrue: [^sent]
+    Result ok: (sent value withoutStream: ref)
+
   /// A fresh stream record: the request body waits in `#pending` until
   /// the send windows let it out; `#frag` accumulates a split response
   /// header block as nil or `{fragment, endStream}` (the `END_STREAM`
