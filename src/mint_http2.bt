@@ -137,14 +137,14 @@ sealed typed Value subclass: MintHTTP2
     verify := MintHTTP1 verifyOf: opts
     ip := MintHTTP1 resolve: host
     ip isError ifTrue: [^ip]
-    sni := MintHTTP1 sniOf: host
-    rawOpts := sni isNil
-      ifTrue: [
-        #(#binary, {#packet, #raw}, {#active, false}, {#verify, verify}, {#alpn_advertised_protocols, #(MintHTTP2 alpnProtocol)})
-      ]
-      ifFalse: [
-        #(#binary, {#packet, #raw}, {#active, false}, {#verify, verify}, {#alpn_advertised_protocols, #(MintHTTP2 alpnProtocol)}, {#server_name_indication, sni})
-      ]
+    // `Tls` owns the OTP-version compat, CA bundle, hostname check,
+    // and SNI omission for IP literals (BT-4551); `#verify_none`
+    // stays the default via `verifyOf:`, so behavior is unchanged.
+    @expect type
+    rawOpts :: List(Object) := Tls
+      clientOptions: host
+      alpn: #("h2")
+      verify: verify
     sock := MintTlsSocket
       connect: ip value
       port: port
