@@ -14,6 +14,9 @@ TestCase subclass: MintH2FrameTest
     self assert: frame equals: {#settings, #{}}
     self assert: rest size equals: 0
 
+  testPrefaceBytes =>
+    self assert: MintH2Frame preface equals: (Binary fromBytes: #(80, 82, 73, 32, 42, 32, 72, 84, 84, 80, 47, 50, 46, 48, 13, 10, 13, 10, 83, 77, 13, 10, 13, 10))
+
   testSettingsAckRoundTrip =>
     {tag, frame, rest} := self parse: MintH2Frame settingsAck
     self assert: tag equals: #ok

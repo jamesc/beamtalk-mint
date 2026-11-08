@@ -35,7 +35,7 @@ sealed typed Object subclass: MintH2Frame
 
   /// The client connection preface (RFC 9113 §3.4).
   class sealed preface -> Binary =>
-    (Binary fromIolist: "PRI * HTTP/2.0") concat: (Binary fromBytes: #(13, 10, 13, 10, 83, 77, 13, 10, 13, 10))
+    (Binary fromIolist: "PRI * HTTP/2.0") concat: (Binary fromIolist: "\r\n\r\nSM\r\n\r\n")
 
   /// The default flow-control window (RFC 9113 §6.9.2).
   class sealed defaultWindow -> Integer => 65535
