@@ -168,15 +168,29 @@ sealed typed Value subclass: MintHTTP1
       opts: rawOpts
       timeout: timeout
     sock isError ifTrue: [^sock]
-    check := self checkAlpn: (MintHTTP1 bare: ((Erlang ssl) negotiated_protocol: (sock value) handle)) offered: alpn
+    self
+      connectTlsOn: sock value
+      host: host
+      port: port
+      options: opts
+
+  /// Open a TLS connection over an already-connected socket: the
+  /// out-of-tree path for clients that configure their own socket
+  /// (e.g. with CA options `connectTls:` cannot take). Runs the ALPN
+  /// check and answers the connection. An ALPN mismatch closes the
+  /// socket and answers the error, mirroring `connectTls:`.
+  class sealed connectTlsOn: sock :: MintTlsSocket host: host :: String port: port :: Integer options: opts :: Dictionary(Symbol, Object) -> Result(MintHTTP1, Object) =>
+    timeout := self timeoutOf: opts
+    alpn := self alpnOf: opts
+    check := self checkAlpn: (MintHTTP1 bare: ((Erlang ssl) negotiated_protocol: (sock handle))) offered: alpn
     check isError
       ifTrue: [
-        (sock value) close
+        sock close
         ^check
       ]
     Result
       ok: (MintHTTP1
-        socket: sock value
+        socket: sock
         transport: #tls
         host: host
         port: port

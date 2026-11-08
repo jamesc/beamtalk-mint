@@ -1,0 +1,76 @@
+// Copyright 2026 mint authors
+// SPDX-License-Identifier: Apache-2.0
+
+/// `connectTlsOn:` (BT-4540): the out-of-tree path — a client-owned,
+/// already-connected socket handed to mint for the TLS handshake.
+/// These tests are the first such consumer.
+TestCase subclass: MintOnSocketTest
+  field: srv = nil
+  field: port = 0
+
+  certfile -> String => "test/fixtures/cert.pem"
+
+  keyfile -> String => "test/fixtures/key.pem"
+
+  setUp =>
+    server := MintTestServer spawn
+    self.port := (server
+      startTls: self certfile
+      keyfile: self keyfile
+      alpn: nil) unwrap
+    self.srv := server
+    self
+
+  tearDown => self.srv isNil ifFalse: [self.srv shutdown]
+
+  rawSocket: port alpn: protos =>
+    ip := (MintHTTP1 resolve: "127.0.0.1") unwrap
+    (MintTlsSocket
+      connect: ip
+      port: port
+      opts: #(#binary, {#packet, #raw}, {#active, false}, {#verify, #verify_none}, {#alpn_advertised_protocols, protos})
+      timeout: 5000) unwrap
+
+  testH1OnSocketRoundTrip =>
+    self.srv acceptNext!
+    sock := self rawSocket: self.port alpn: (MintHTTP1 alpnOf: (Dictionary new))
+    conn := (MintHTTP1
+      connectTlsOn: sock
+      host: "127.0.0.1"
+      port: self.port
+      options: (Dictionary new)) unwrap
+    {live, ref} := (conn
+      request: "GET"
+      target: "/tls"
+      headers: #()
+      body: "") unwrap
+    (self.srv serveNext: {#resp, 200, #(), "tls-hi"}) unwrap
+    {done, parts} := (live stream: ref timeout: 5000) unwrap
+    self assert: ((parts at: 1) at: 3) equals: 200
+    self assert: (((parts at: 3) at: 3) asStringUnchecked) equals: "tls-hi"
+    done close
+
+  testH2OnSocketRoundTrip =>
+    server := MintH2TestServer spawn
+    port := (server
+      startTls: self certfile
+      keyfile: self keyfile
+      alpn: #("h2")) unwrap
+    server acceptHandshake!
+    sock := self rawSocket: port alpn: #(MintHTTP2 alpnProtocol)
+    conn := (MintHTTP2
+      connectTlsOn: sock
+      host: "127.0.0.1"
+      port: port
+      options: (Dictionary new)) unwrap
+    {live, ref} := (conn
+      request: "GET"
+      target: "/tls"
+      headers: #()
+      body: "") unwrap
+    (server serveNext: {#resp, 200, #(), "tls-hi"}) unwrap
+    {done, parts} := (live stream: ref timeout: 5000) unwrap
+    self assert: ((parts at: 1) at: 3) equals: 200
+    self assert: (((parts at: 3) at: 3) asStringUnchecked) equals: "tls-hi"
+    done close
+    server shutdown
