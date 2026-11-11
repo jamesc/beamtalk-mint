@@ -3,7 +3,7 @@
 
 [package]
 name = "mint"
-version = "0.2.0"
+version = "0.2.1"
 description = "Pure-Beamtalk HTTP client (Mint port): processless HTTP/1 and HTTP/2 connections over gen_tcp/ssl"
 
 [dependencies]
