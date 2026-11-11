@@ -9,7 +9,7 @@
 /// `acceptNext` runs the accept/handshake half for the ALPN-mismatch
 /// test, where the client never sends HTTP.
 Actor subclass: MintTestServer
-  state: lsock :: MintSocket | Nil = nil
+  state: lsock :: MintTcpSocket | MintTlsSocket | Nil = nil
   state: conn :: MintSocket | Nil = nil
   state: useTls = nil
   state: rest :: Binary = Binary fromBytes: #()
