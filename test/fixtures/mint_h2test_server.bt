@@ -253,7 +253,7 @@ Actor subclass: MintH2TestServer
   /// `Result ok:` the parsed frame with no side effects beyond
   /// recording (see `noteFrame:`): connection-level frames are NOT
   /// answered here, so handshake and request loops stay in control.
-  readRawFrame -> Result(Object, Object) =>
+  readRawFrame -> Result(Dynamic, Object) =>
     parsed := MintH2Frame parse: self.rest maxFrame: 16384
     parsed =:= #more
       ifTrue: [
@@ -271,7 +271,7 @@ Actor subclass: MintH2TestServer
   /// Read one stream-level frame: connection-level frames (`SETTINGS`
   /// acked, `PING` acked, `WINDOW_UPDATE`/`GOAWAY`/unknown skipped) are
   /// answered or dropped inline and the next frame is read.
-  readFrame -> Result(Object, Object) =>
+  readFrame -> Result(Dynamic, Object) =>
     raw := self readRawFrame
     raw isError ifTrue: [^raw]
     frame := raw value
@@ -410,7 +410,7 @@ Actor subclass: MintH2TestServer
       fsid =:= sid ifFalse: [^Result error: "interleaved streams unsupported"]
     ]
     frag isNil ifFalse: [^Result error: "HEADERS while header block continues"]
-    full := frag isNil ifTrue: [piece] ifFalse: [frag concat: piece]
+    full := piece
     endHeaders
       ifTrue: [
         ^self

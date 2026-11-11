@@ -946,7 +946,8 @@ sealed typed Value subclass: MintHTTP2
     live := topped value
     endStream
       ifTrue: [
-        ended := live withStream: sid put: ((live streams at: sid) at: #done put: true)
+        current :: Dictionary(Symbol, Object) := live streams at: sid
+        ended := live withStream: sid put: (current at: #done put: true)
         finished :: Dictionary(Symbol, Object) := ended streams at: sid
         ^ended
           collectDone: sid
