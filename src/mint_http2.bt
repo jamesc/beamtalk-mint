@@ -81,19 +81,19 @@ sealed typed Value subclass: MintHTTP2
   // ===== Connect =====
 
   /// The default `recv`/`connect` timeout in milliseconds.
-  class sealed defaultTimeout -> Integer => 5000
+  class defaultTimeout -> Integer => 5000
 
   /// The ALPN protocol negotiated on TLS connections.
-  class sealed alpnProtocol -> Binary => Binary fromIolist: "h2"
+  class alpnProtocol -> Binary => Binary fromIolist: "h2"
 
   /// Cap a buffered response header block at 64KB: a peer sending more
   /// is misbehaving (or hostile), and an immutable `Value` pays O(n^2)
   /// to accumulate it.
-  class sealed maxHeaderBlock -> Integer => 65536
+  class maxHeaderBlock -> Integer => 65536
 
   /// Open a prior-knowledge cleartext (`h2c`) connection. Answers
   /// `Result ok:` with the handshaked connection.
-  class sealed connect: host :: String port: port :: Integer -> Result(MintHTTP2, Object) =>
+  class connect: host :: String port: port :: Integer -> Result(MintHTTP2, Object) =>
     self
       connect: host
       port: port
@@ -101,7 +101,7 @@ sealed typed Value subclass: MintHTTP2
 
   /// Open a prior-knowledge cleartext connection with options
   /// (`#timeout` in milliseconds).
-  class sealed connect: host :: String port: port :: Integer options: opts :: Dictionary(Symbol, Object) -> Result(MintHTTP2, Object) =>
+  class connect: host :: String port: port :: Integer options: opts :: Dictionary(Symbol, Object) -> Result(MintHTTP2, Object) =>
     timeout := MintHTTP1 timeoutOf: opts
     ip := MintHTTP1 resolve: host
     ip isError ifTrue: [^ip]
@@ -132,7 +132,7 @@ sealed typed Value subclass: MintHTTP2
   /// Open a TLS connection negotiating `h2` over ALPN (`#verify`
   /// default `#verify_none`, `#timeout` in milliseconds). A missing or
   /// different negotiated protocol is an error.
-  class sealed connectTls: host :: String port: port :: Integer options: opts :: Dictionary(Symbol, Object) -> Result(MintHTTP2, Object) =>
+  class connectTls: host :: String port: port :: Integer options: opts :: Dictionary(Symbol, Object) -> Result(MintHTTP2, Object) =>
     timeout := MintHTTP1 timeoutOf: opts
     verify := MintHTTP1 verifyOf: opts
     ip := MintHTTP1 resolve: host
@@ -163,7 +163,7 @@ sealed typed Value subclass: MintHTTP2
   /// then runs the preface/`SETTINGS` handshake via `open:`. An ALPN
   /// mismatch closes the socket and answers the error, mirroring
   /// `connectTls:`.
-  class sealed connectTlsOn: sock :: MintTlsSocket host: host :: String port: port :: Integer options: opts :: Dictionary(Symbol, Object) -> Result(MintHTTP2, Object) =>
+  class connectTlsOn: sock :: MintTlsSocket host: host :: String port: port :: Integer options: opts :: Dictionary(Symbol, Object) -> Result(MintHTTP2, Object) =>
     timeout := MintHTTP1 timeoutOf: opts
     check := MintHTTP2 checkAlpn: (MintHTTP1 bare: ((Erlang ssl) negotiated_protocol: (sock handle)))
     check isError
@@ -191,7 +191,7 @@ sealed typed Value subclass: MintHTTP2
 
   /// The negotiated ALPN protocol must be `h2`: anything else (or none)
   /// is an error, since cleartext fallback cannot apply mid-handshake.
-  class sealed checkAlpn: neg :: Result(Dynamic, Object) -> Result(Nil, Object) =>
+  class checkAlpn: neg :: Result(Dynamic, Object) -> Result(Nil, Object) =>
     neg isError ifTrue: [^Result error: "ALPN h2 required but not negotiated"]
     neg value =:= MintHTTP2 alpnProtocol ifTrue: [^Result ok: nil]
     Result error: "unexpected ALPN protocol: h2 required"
