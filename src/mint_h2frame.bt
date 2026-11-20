@@ -34,32 +34,32 @@ sealed typed Object subclass: MintH2Frame
   // ===== Constants =====
 
   /// The client connection preface (RFC 9113 §3.4).
-  class sealed preface -> Binary =>
+  class preface -> Binary =>
     (Binary fromIolist: "PRI * HTTP/2.0") concat: (Binary fromIolist: "\r\n\r\nSM\r\n\r\n")
 
   /// The default flow-control window (RFC 9113 §6.9.2).
-  class sealed defaultWindow -> Integer => 65535
+  class defaultWindow -> Integer => 65535
 
   /// The default maximum frame payload the client accepts (RFC 9113 §6.5.2).
-  class sealed defaultMaxFrame -> Integer => 16384
+  class defaultMaxFrame -> Integer => 16384
 
   /// `GOAWAY`/`RST_STREAM` code: no error.
-  class sealed noError -> Integer => 0
+  class noError -> Integer => 0
 
   /// `GOAWAY`/`RST_STREAM` code: generic protocol error.
-  class sealed protocolError -> Integer => 1
+  class protocolError -> Integer => 1
 
   /// `GOAWAY`/`RST_STREAM` code: flow-control limits breached.
-  class sealed flowControlError -> Integer => 3
+  class flowControlError -> Integer => 3
 
   /// `GOAWAY`/`RST_STREAM` code: a frame size limit breached.
-  class sealed frameSizeError -> Integer => 6
+  class frameSizeError -> Integer => 6
 
   /// `GOAWAY` code: HPACK decoding failed (RFC 9113 §5.4.1).
-  class sealed compressionError -> Integer => 9
+  class compressionError -> Integer => 9
 
   /// Whether bit `b` of `flags` is set.
-  class sealed flagSet: flags :: Integer bit: b :: Integer -> Boolean =>
+  class flagSet: flags :: Integer bit: b :: Integer -> Boolean =>
     (flags bitAnd: (1 bitShift: b)) =:= 0 ifTrue: [^false]
     true
 
@@ -68,7 +68,7 @@ sealed typed Object subclass: MintH2Frame
   /// Parse one frame from the head of `buffer`: `{#ok, frame, rest}`,
   /// `{#more}`, or `{#error, message}`. `max` caps the accepted payload
   /// size (the client's advertised `max_frame_size`).
-  class sealed parse: buffer :: Binary maxFrame: max :: Integer -> Tuple =>
+  class parse: buffer :: Binary maxFrame: max :: Integer -> Tuple =>
     (buffer size < 9) ifTrue: [^#more]
     buffer match: [
       <<length:24, type:8, flags:8, _reserved:1, sid:31, rest/binary>> -> self
@@ -82,7 +82,7 @@ sealed typed Object subclass: MintH2Frame
     ]
 
   /// Split the payload off `rest` and dispatch on the frame type.
-  class sealed parseBody: rest :: Binary length: length :: Integer type: type :: Integer flags: flags :: Integer sid: sid :: Integer maxFrame: max :: Integer -> Tuple =>
+  class parseBody: rest :: Binary length: length :: Integer type: type :: Integer flags: flags :: Integer sid: sid :: Integer maxFrame: max :: Integer -> Tuple =>
     (rest size < length) ifTrue: [^#more]
     length > max ifTrue: [^{#error, "frame payload exceeds max_frame_size"}]
     payload := rest part: 0 size: length
@@ -97,7 +97,7 @@ sealed typed Object subclass: MintH2Frame
 
   /// Dispatch a fully-buffered payload on its type, answering
   /// `{#ok, frame}` or `{#error, message}`.
-  class sealed dispatch: type :: Integer flags: flags :: Integer sid: sid :: Integer payload: payload :: Binary -> Tuple =>
+  class dispatch: type :: Integer flags: flags :: Integer sid: sid :: Integer payload: payload :: Binary -> Tuple =>
     type match: [
       0 -> self
         data: flags
@@ -140,7 +140,7 @@ sealed typed Object subclass: MintH2Frame
     ]
 
   /// A DATA frame: stream 0 and short payloads are connection errors.
-  class sealed data: flags :: Integer sid: sid :: Integer payload: payload :: Binary -> Tuple =>
+  class data: flags :: Integer sid: sid :: Integer payload: payload :: Binary -> Tuple =>
     sid =:= 0 ifTrue: [^{#error, "DATA frame with zero stream_id"}]
     (self flagSet: flags bit: 3)
       ifTrue: [
@@ -152,7 +152,7 @@ sealed typed Object subclass: MintH2Frame
     {#ok, {#data, sid, (self flagSet: flags bit: 0), payload}}
 
   /// A padded DATA frame: strip the pad-length byte and trailing padding.
-  class sealed paddedData: flags :: Integer sid: sid :: Integer payload: payload :: Binary -> Tuple =>
+  class paddedData: flags :: Integer sid: sid :: Integer payload: payload :: Binary -> Tuple =>
     payload size =:= 0 ifTrue: [
       ^{#error, "DATA frame with insufficient padding data"}
     ]
@@ -167,7 +167,7 @@ sealed typed Object subclass: MintH2Frame
 
   /// A HEADERS frame: stream 0 is a connection error; priority data is
   /// skipped (the client never prioritizes).
-  class sealed headers: flags :: Integer sid: sid :: Integer payload: payload :: Binary -> Tuple =>
+  class headers: flags :: Integer sid: sid :: Integer payload: payload :: Binary -> Tuple =>
     sid =:= 0 ifTrue: [^{#error, "HEADERS frame with zero stream_id"}]
     endStream := self flagSet: flags bit: 0
     endHeaders := self flagSet: flags bit: 2
@@ -194,7 +194,7 @@ sealed typed Object subclass: MintH2Frame
     {#ok, {#headers, sid, endStream, endHeaders, payload}}
 
   /// Strip padding, then optional priority data, from a HEADERS payload.
-  class sealed paddedHeaders: _flags :: Integer sid: sid :: Integer endStream: endStream :: Boolean endHeaders: endHeaders :: Boolean hasPriority: hasPriority :: Boolean payload: payload :: Binary -> Tuple =>
+  class paddedHeaders: _flags :: Integer sid: sid :: Integer endStream: endStream :: Boolean endHeaders: endHeaders :: Boolean hasPriority: hasPriority :: Boolean payload: payload :: Binary -> Tuple =>
     payload size =:= 0 ifTrue: [
       ^{#error, "HEADERS frame with insufficient data for its flags"}
     ]
@@ -217,7 +217,7 @@ sealed typed Object subclass: MintH2Frame
     ]
 
   /// Skip the 5 priority bytes of a HEADERS payload.
-  class sealed priorityHeaders: endStream :: Boolean endHeaders: endHeaders :: Boolean payload: payload :: Binary sid: sid :: Integer -> Tuple =>
+  class priorityHeaders: endStream :: Boolean endHeaders: endHeaders :: Boolean payload: payload :: Binary sid: sid :: Integer -> Tuple =>
     payload match: [
       <<_exclusive:1, _dependency:31, _weight:8, fragment/binary>> -> {#ok, {#headers, sid, endStream, endHeaders, fragment}};
       _ -> {#error, "HEADERS frame with insufficient data for its flags"}
@@ -225,7 +225,7 @@ sealed typed Object subclass: MintH2Frame
 
   /// A PRIORITY frame: parsed and ignored (answers `#unknown` with its
   /// type, so the connection layer just drops it).
-  class sealed priority: flags :: Integer sid: sid :: Integer payload: payload :: Binary -> Tuple =>
+  class priority: flags :: Integer sid: sid :: Integer payload: payload :: Binary -> Tuple =>
     sid =:= 0 ifTrue: [^{#error, "PRIORITY frame with zero stream_id"}]
     payload match: [
       <<_reserved:1, _dep:31, _weight:8>> -> {#ok, {#unknown, 2, flags, sid, payload}};
@@ -233,7 +233,7 @@ sealed typed Object subclass: MintH2Frame
     ]
 
   /// A RST_STREAM frame: stream 0 and short payloads are errors.
-  class sealed rstStream: _flags :: Integer sid: sid :: Integer payload: payload :: Binary -> Tuple =>
+  class rstStream: _flags :: Integer sid: sid :: Integer payload: payload :: Binary -> Tuple =>
     sid =:= 0 ifTrue: [^{#error, "RST_STREAM frame with zero stream_id"}]
     payload match: [
       <<code:32>> -> {#ok, {#rstStream, sid, code}};
@@ -242,7 +242,7 @@ sealed typed Object subclass: MintH2Frame
 
   /// A SETTINGS frame: stream 0 only; an ACK must be empty; parameters
   /// parse into the params dictionary (unknown ids are ignored).
-  class sealed settings: flags :: Integer sid: sid :: Integer payload: payload :: Binary -> Tuple =>
+  class settings: flags :: Integer sid: sid :: Integer payload: payload :: Binary -> Tuple =>
     sid =:= 0 ifFalse: [^{#error, "Invalid SETTINGS frame"}]
     ack := self flagSet: flags bit: 0
     ack
@@ -254,7 +254,7 @@ sealed typed Object subclass: MintH2Frame
       ifFalse: [self settingsParams: payload acc: #{}]
 
   /// Parse 6-byte setting entries into `acc`.
-  class sealed settingsParams: payload :: Binary acc: acc :: Dictionary(Symbol, Object) -> Tuple =>
+  class settingsParams: payload :: Binary acc: acc :: Dictionary(Symbol, Object) -> Tuple =>
     payload size =:= 0 ifTrue: [^{#ok, {#settings, acc}}]
     payload match: [
       <<id:16, value:32, rest/binary>> -> self
@@ -266,7 +266,7 @@ sealed typed Object subclass: MintH2Frame
     ]
 
   /// Fold one setting entry into `acc` (unknown ids ignored).
-  class sealed settingParam: id :: Integer value: value :: Integer rest: rest :: Binary acc: acc :: Dictionary(Symbol, Object) -> Tuple =>
+  class settingParam: id :: Integer value: value :: Integer rest: rest :: Binary acc: acc :: Dictionary(Symbol, Object) -> Tuple =>
     id match: [
       1 -> self settingsParams: rest acc: (acc at: #header_table_size put: value);
       2 -> (value =:= 0 or: [
@@ -292,14 +292,14 @@ sealed typed Object subclass: MintH2Frame
     ]
 
   /// A PING frame: 8-byte payloads only, stream 0 only.
-  class sealed ping: flags :: Integer sid: sid :: Integer payload: payload :: Binary -> Tuple =>
+  class ping: flags :: Integer sid: sid :: Integer payload: payload :: Binary -> Tuple =>
     sid =:= 0 ifFalse: [^{#error, "Invalid stream ID in PING frame"}]
     payload size =:= 8 ifTrue: [
       ^{#ok, {#ping, (self flagSet: flags bit: 0), payload}}
     ] ifFalse: [^{#error, "PING frame with invalid payload size"}]
 
   /// A GOAWAY frame: stream 0 only.
-  class sealed goaway: _flags :: Integer sid: sid :: Integer payload: payload :: Binary -> Tuple =>
+  class goaway: _flags :: Integer sid: sid :: Integer payload: payload :: Binary -> Tuple =>
     sid =:= 0 ifFalse: [^{#error, "Invalid stream ID in GOAWAY frame"}]
     payload match: [
       <<_reserved:1, last:31, code:32, _debug/binary>> -> {#ok, {#goaway, last, code}};
@@ -307,7 +307,7 @@ sealed typed Object subclass: MintH2Frame
     ]
 
   /// A WINDOW_UPDATE frame: zero increments are connection errors.
-  class sealed windowUpdate: _flags :: Integer sid: sid :: Integer payload: payload :: Binary -> Tuple =>
+  class windowUpdate: _flags :: Integer sid: sid :: Integer payload: payload :: Binary -> Tuple =>
     payload match: [
       <<_reserved:1, 0:31>> -> {#error, "Invalid WINDOW_UPDATE size increment"};
       <<_r:1, inc:31>> -> {#ok, {#windowUpdate, sid, inc}};
@@ -315,36 +315,35 @@ sealed typed Object subclass: MintH2Frame
     ]
 
   /// A CONTINUATION frame: stream 0 is a connection error.
-  class sealed continuation: flags :: Integer sid: sid :: Integer payload: payload :: Binary -> Tuple =>
+  class continuation: flags :: Integer sid: sid :: Integer payload: payload :: Binary -> Tuple =>
     sid =:= 0 ifTrue: [^{#error, "CONTINUATION frame with zero stream_id"}]
     {#ok, {#continuation, sid, (self flagSet: flags bit: 2), payload}}
 
   // ===== Serializing =====
 
   /// The 9-byte frame header.
-  class sealed header: length :: Integer type: type :: Integer flags: flags :: Integer streamId: sid :: Integer -> Binary =>
+  class header: length :: Integer type: type :: Integer flags: flags :: Integer streamId: sid :: Integer -> Binary =>
     Binary fromBytes: #((length bitShift: -16) bitAnd: 255, (length bitShift: -8) bitAnd: 255, length bitAnd: 255, type, flags, (sid bitShift: -24) bitAnd: 127, (sid bitShift: -16) bitAnd: 255, (sid bitShift: -8) bitAnd: 255, sid bitAnd: 255)
 
   /// A 16-bit big-endian integer.
-  class sealed bytes16: n :: Integer -> Binary =>
+  class bytes16: n :: Integer -> Binary =>
     Binary fromBytes: #((n bitShift: -8) bitAnd: 255, n bitAnd: 255)
 
   /// A 32-bit big-endian integer.
-  class sealed bytes32: n :: Integer -> Binary =>
+  class bytes32: n :: Integer -> Binary =>
     Binary fromBytes: #((n bitShift: -24) bitAnd: 255, (n bitShift: -16) bitAnd: 255, (n bitShift: -8) bitAnd: 255, n bitAnd: 255)
 
   /// A 31-bit big-endian integer (the top bit cleared).
-  class sealed bytes31: n :: Integer -> Binary =>
-    self bytes32: (n bitAnd: 2147483647)
+  class bytes31: n :: Integer -> Binary => self bytes32: (n bitAnd: 2147483647)
 
   /// The next chunk size for a `size`-byte payload capped at `max`.
-  class sealed chunkOf: size :: Integer max: max :: Integer -> Integer =>
+  class chunkOf: size :: Integer max: max :: Integer -> Integer =>
     size <= max ifTrue: [^size]
     max
 
   /// An empty SETTINGS frame (all defaults: the client never tunes what
   /// it receives in v1 — its tables and windows start at the defaults).
-  class sealed emptySettings -> Binary =>
+  class emptySettings -> Binary =>
     self
       header: 0
       type: 4
@@ -353,7 +352,7 @@ sealed typed Object subclass: MintH2Frame
 
   /// A SETTINGS frame from `params` (setting Symbols to Integers;
   /// defaults are still written out explicitly).
-  class sealed settings: params :: Dictionary(Symbol, Object) -> Binary =>
+  class settings: params :: Dictionary(Symbol, Object) -> Binary =>
     body := Binary fromBytes: #()
     params keys do: [:key |
       body := body concat: (self settingEntry: key value: (params at: key))
@@ -365,14 +364,14 @@ sealed typed Object subclass: MintH2Frame
       streamId: 0) concat: body
 
   /// One 6-byte setting entry (unknown keys encode empty).
-  class sealed settingEntry: key :: Symbol value: value :: Object -> Binary =>
+  class settingEntry: key :: Symbol value: value :: Object -> Binary =>
     id := self settingId: key
     id isNil ifTrue: [^Binary fromBytes: #()]
     (value isKindOf: Integer) ifFalse: [^Binary fromBytes: #()]
     (self bytes16: id) concat: (self bytes32: value)
 
   /// A setting Symbol's wire id, or nil.
-  class sealed settingId: key :: Symbol -> Integer | Nil =>
+  class settingId: key :: Symbol -> Integer | Nil =>
     key =:= #header_table_size ifTrue: [^1]
     key =:= #enable_push ifTrue: [^2]
     key =:= #max_concurrent_streams ifTrue: [^3]
@@ -382,7 +381,7 @@ sealed typed Object subclass: MintH2Frame
     nil
 
   /// A SETTINGS acknowledgement.
-  class sealed settingsAck -> Binary =>
+  class settingsAck -> Binary =>
     self
       header: 0
       type: 4
@@ -393,7 +392,7 @@ sealed typed Object subclass: MintH2Frame
   /// `max`-byte chunk goes in HEADERS, the rest in CONTINUATIONs, and
   /// only the last frame carries `END_HEADERS`. `endStream` rides on the
   /// HEADERS frame.
-  class sealed headers: sid :: Integer endStream: endStream :: Boolean fragment: fragment :: Binary maxFrame: max :: Integer -> Binary =>
+  class headers: sid :: Integer endStream: endStream :: Boolean fragment: fragment :: Binary maxFrame: max :: Integer -> Binary =>
     first := fragment part: 0 size: (self chunkOf: fragment size max: max)
     endFlag := endStream ifTrue: [1] ifFalse: [0]
     rest := fragment part: first size size: (fragment size - first size)
@@ -417,7 +416,7 @@ sealed typed Object subclass: MintH2Frame
         maxFrame: max)
 
   /// CONTINUATION frames for `fragment`: all but the last carry no flags.
-  class sealed continuations: sid :: Integer fragment: fragment :: Binary maxFrame: max :: Integer -> Binary =>
+  class continuations: sid :: Integer fragment: fragment :: Binary maxFrame: max :: Integer -> Binary =>
     first := fragment part: 0 size: (self chunkOf: fragment size max: max)
     rest := fragment part: first size size: (fragment size - first size)
     rest size =:= 0
@@ -442,7 +441,7 @@ sealed typed Object subclass: MintH2Frame
   /// DATA frames for `bytes` on `sid`, chunked at `max` bytes (no
   /// `END_STREAM` — the caller appends it by sending a final empty DATA
   /// or setting the flag through `dataEnd:`).
-  class sealed datas: sid :: Integer bytes: bytes :: Binary maxFrame: max :: Integer -> Binary =>
+  class datas: sid :: Integer bytes: bytes :: Binary maxFrame: max :: Integer -> Binary =>
     bytes size =:= 0 ifTrue: [^Binary fromBytes: #()]
     first := bytes part: 0 size: (self chunkOf: bytes size max: max)
     rest := bytes part: first size size: (bytes size - first size)
@@ -459,7 +458,7 @@ sealed typed Object subclass: MintH2Frame
         maxFrame: max)
 
   /// A final empty DATA frame carrying `END_STREAM` on `sid`.
-  class sealed dataEnd: sid :: Integer -> Binary =>
+  class dataEnd: sid :: Integer -> Binary =>
     self
       header: 0
       type: 0
@@ -467,7 +466,7 @@ sealed typed Object subclass: MintH2Frame
       streamId: sid
 
   /// A PING acknowledgement for `payload`.
-  class sealed pingAck: payload :: Binary -> Binary =>
+  class pingAck: payload :: Binary -> Binary =>
     (self
       header: 8
       type: 6
@@ -475,7 +474,7 @@ sealed typed Object subclass: MintH2Frame
       streamId: 0) concat: payload
 
   /// A WINDOW_UPDATE for `increment` on `sid` (0 is the connection).
-  class sealed windowUpdate: sid :: Integer increment: inc :: Integer -> Binary =>
+  class windowUpdate: sid :: Integer increment: inc :: Integer -> Binary =>
     (self
       header: 4
       type: 8
@@ -483,7 +482,7 @@ sealed typed Object subclass: MintH2Frame
       streamId: sid) concat: (self bytes31: inc)
 
   /// A RST_STREAM frame with `code` on `sid`.
-  class sealed rstStream: sid :: Integer code: code :: Integer -> Binary =>
+  class rstStream: sid :: Integer code: code :: Integer -> Binary =>
     (self
       header: 4
       type: 3
@@ -492,7 +491,7 @@ sealed typed Object subclass: MintH2Frame
 
   /// A GOAWAY frame: `lastId` is the last stream the peer might have
   /// processed, `code` the reason.
-  class sealed goaway: lastId :: Integer code: code :: Integer -> Binary =>
+  class goaway: lastId :: Integer code: code :: Integer -> Binary =>
     body := (self bytes31: lastId) concat: (self bytes32: code)
     (self
       header: body size

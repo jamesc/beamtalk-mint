@@ -62,14 +62,14 @@ sealed typed Value subclass: MintHTTP1
   // ===== Connect =====
 
   /// The default `recv`/`connect` timeout in milliseconds.
-  class sealed defaultTimeout -> Integer => 5000
+  class defaultTimeout -> Integer => 5000
 
   /// The default ALPN protocols offered on TLS connections.
-  class sealed defaultAlpn -> List(String) => #("http/1.1")
+  class defaultAlpn -> List(String) => #("http/1.1")
 
   /// The `#timeout` option: milliseconds, defaulting to
   /// `defaultTimeout`. Anything else raises.
-  class sealed timeoutOf: opts :: Dictionary(Symbol, Object) -> Integer =>
+  class timeoutOf: opts :: Dictionary(Symbol, Object) -> Integer =>
     raw := opts at: #timeout ifAbsent: [^self defaultTimeout]
     (raw isKindOf: Integer) ifFalse: [
       Error signal: "timeout must be an Integer number of milliseconds"
@@ -77,14 +77,14 @@ sealed typed Value subclass: MintHTTP1
     raw
 
   /// The `#verify` option: a Symbol, default `#verify_none`.
-  class sealed verifyOf: opts :: Dictionary(Symbol, Object) -> Symbol =>
+  class verifyOf: opts :: Dictionary(Symbol, Object) -> Symbol =>
     raw := opts at: #verify ifAbsent: [^#verify_none]
     (raw isKindOf: Symbol) ifFalse: [Error signal: "verify must be a Symbol"]
     raw
 
   /// The `#alpn` option as Strings, for `Tls clientOptions:alpn:`.
   /// The user passes a List of Strings, default `defaultAlpn`.
-  class sealed alpnStringsOf: opts :: Dictionary(Symbol, Object) -> List(String) =>
+  class alpnStringsOf: opts :: Dictionary(Symbol, Object) -> List(String) =>
     raw := opts at: #alpn ifAbsent: [^self defaultAlpn]
     (raw isKindOf: List) ifFalse: [
       Error signal: "alpn must be a List of Strings"
@@ -95,37 +95,37 @@ sealed typed Value subclass: MintHTTP1
   /// The `#alpn` option as raw Binaries (Erlang compares them
   /// against raw binaries; tagged Strings never match). The user
   /// passes a List of Strings, default `defaultAlpn`.
-  class sealed alpnOf: opts :: Dictionary(Symbol, Object) -> List(Binary) =>
+  class alpnOf: opts :: Dictionary(Symbol, Object) -> List(Binary) =>
     (self alpnStringsOf: opts) collect: [:each | Binary fromIolist: each]
 
   /// The SNI value for a DNS-name host, nil for an IP literal
   /// (SNI must not carry an IP: Erlang rejects it, and it stalls
   /// ALPN handshakes against our test server). A charlist: OTP
   /// `ssl` rejects a Binary `server_name_indication`.
-  class sealed sniOf: host :: String -> List(Integer) | Nil =>
+  class sniOf: host :: String -> List(Integer) | Nil =>
     parsed := MintHTTP1 bare: ((Erlang inet) parse_address: (host toBytes))
     parsed isOk ifTrue: [^nil]
     host asCharlist
 
   /// The CRLF CRLF bytes ending a response head.
-  class sealed headTerminator -> Binary => Binary fromIolist: "\r\n\r\n"
+  class headTerminator -> Binary => Binary fromIolist: "\r\n\r\n"
 
   /// The CRLF bytes ending a response line.
-  class sealed lineTerminator -> Binary => Binary fromIolist: "\r\n"
+  class lineTerminator -> Binary => Binary fromIolist: "\r\n"
 
   /// CRLF as text (string escapes since ADR 0138).
-  class sealed crlf -> String => "\r\n"
+  class crlf -> String => "\r\n"
 
   /// Open a cleartext connection. Answers `Result ok:` with the
   /// connected value, or `Result error:` with the Erlang reason.
-  class sealed connect: host :: String port: port :: Integer -> Result(MintHTTP1, Object) =>
+  class connect: host :: String port: port :: Integer -> Result(MintHTTP1, Object) =>
     self
       connect: host
       port: port
       options: (Dictionary new)
 
   /// Open a cleartext connection with options (`#timeout`).
-  class sealed connect: host :: String port: port :: Integer options: opts :: Dictionary(Symbol, Object) -> Result(MintHTTP1, Object) =>
+  class connect: host :: String port: port :: Integer options: opts :: Dictionary(Symbol, Object) -> Result(MintHTTP1, Object) =>
     timeout := self timeoutOf: opts
     ip := self resolve: host
     ip isError ifTrue: [^ip]
@@ -151,7 +151,7 @@ sealed typed Value subclass: MintHTTP1
   /// `#verify_none`, `#alpn` default `#("http/1.1")`). The ALPN
   /// negotiation is checked: an unexpected protocol is an error, while
   /// no negotiation (a server without ALPN) proceeds as HTTP/1.1.
-  class sealed connectTls: host :: String port: port :: Integer options: opts :: Dictionary(Symbol, Object) -> Result(MintHTTP1, Object) =>
+  class connectTls: host :: String port: port :: Integer options: opts :: Dictionary(Symbol, Object) -> Result(MintHTTP1, Object) =>
     timeout := self timeoutOf: opts
     verify := self verifyOf: opts
     alpn := self alpnStringsOf: opts
@@ -182,7 +182,7 @@ sealed typed Value subclass: MintHTTP1
   /// (e.g. with CA options `connectTls:` cannot take). Runs the ALPN
   /// check and answers the connection. An ALPN mismatch closes the
   /// socket and answers the error, mirroring `connectTls:`.
-  class sealed connectTlsOn: sock :: MintTlsSocket host: host :: String port: port :: Integer options: opts :: Dictionary(Symbol, Object) -> Result(MintHTTP1, Object) =>
+  class connectTlsOn: sock :: MintTlsSocket host: host :: String port: port :: Integer options: opts :: Dictionary(Symbol, Object) -> Result(MintHTTP1, Object) =>
     timeout := self timeoutOf: opts
     alpn := self alpnOf: opts
     check := self checkAlpn: (MintHTTP1 bare: ((Erlang ssl) negotiated_protocol: (sock handle))) offered: alpn
@@ -207,7 +207,7 @@ sealed typed Value subclass: MintHTTP1
   /// `TransportResult bare:` rule, ADR 0076): exceptions answer their
   /// `reason`, anything else (atoms, tuples) passes through, so live
   /// reasons compare with `=:=` instead of staying `RuntimeError`s.
-  class sealed bare: result :: Dynamic -> Result(Dynamic, Object) =>
+  class bare: result :: Dynamic -> Result(Dynamic, Object) =>
     result mapError: [:e |
       (e isKindOf: Exception) ifTrue: [e reason] ifFalse: [e]
     ]
@@ -217,7 +217,7 @@ sealed typed Value subclass: MintHTTP1
   /// host reaches them unusable). Answers `Result ok:` with the tuple.
   /// IP literals short-circuit through `parse_address` (either
   /// family); DNS names try IPv4 first, then IPv6.
-  class sealed resolve: host :: String -> Result(Dynamic, Object) =>
+  class resolve: host :: String -> Result(Dynamic, Object) =>
     parsed := MintHTTP1 bare: ((Erlang inet) parse_address: (host toBytes))
     parsed isOk ifTrue: [^parsed]
     v4 := MintHTTP1 bare: ((Erlang inet) getaddr: host toBytes with: #inet)
@@ -228,7 +228,7 @@ sealed typed Value subclass: MintHTTP1
   /// negotiation (`#protocol_not_negotiated`, a server without ALPN)
   /// proceeds; any other transport error propagates; a negotiated
   /// protocol outside the offered list is an error.
-  class sealed checkAlpn: neg :: Result(Dynamic, Object) offered: offered :: List(Binary) -> Result(Nil, Object) =>
+  class checkAlpn: neg :: Result(Dynamic, Object) offered: offered :: List(Binary) -> Result(Nil, Object) =>
     neg isError
       ifTrue: [
         neg error =:= #protocol_not_negotiated ifTrue: [
@@ -242,7 +242,7 @@ sealed typed Value subclass: MintHTTP1
   /// A test-only connection over a preset byte buffer with no socket:
   /// `stream` parses from the buffer, and reads past its end answer a
   /// truncation error instead of touching the network.
-  class sealed buffered: bytes :: TextOrBytes -> MintHTTP1 =>
+  class buffered: bytes :: TextOrBytes -> MintHTTP1 =>
     MintHTTP1
       socket: nil
       transport: #tcp
@@ -257,7 +257,7 @@ sealed typed Value subclass: MintHTTP1
   /// Parse head bytes into `{version, status, headers}`: `version` is
   /// `{#http1, major, minor}`. Answers a `Result error:` on malformed
   /// bytes (never raise on peer input).
-  class sealed parseHead: head :: Binary -> Result(Tuple, Object) =>
+  class parseHead: head :: Binary -> Result(Tuple, Object) =>
     lines := self splitLines: head
     lines isEmpty ifTrue: [^Result error: "empty response head"]
     statusLine := lines at: 1
@@ -269,12 +269,12 @@ sealed typed Value subclass: MintHTTP1
 
   /// Lines from 1-based `i` onward (recursion keeps every step in
   /// plain method frames).
-  class sealed tailFrom: lines :: List(Binary) from: i :: Integer -> List(Binary) =>
+  class tailFrom: lines :: List(Binary) from: i :: Integer -> List(Binary) =>
     i > lines size ifTrue: [^#()]
     #((lines at: i)) ++ (self tailFrom: lines from: (i + 1))
 
   /// Split head bytes on CRLF (the terminator itself is excluded).
-  class sealed splitLines: head :: Binary -> List(Binary) =>
+  class splitLines: head :: Binary -> List(Binary) =>
     out :: List(Binary) := #()
     rest := head
     [true]
@@ -290,7 +290,7 @@ sealed typed Value subclass: MintHTTP1
   /// passes through as opaque Binary. Written era-proof across the
   /// BT-4170 `asString` flip (bare String, then `Result`): every
   /// shape is handled.
-  class sealed stringOrOpaque: bin :: Binary -> TextOrBytes =>
+  class stringOrOpaque: bin :: Binary -> TextOrBytes =>
     bin asString match: [
       s :: String -> s;
       r :: Result -> r isError ifTrue: [bin] ifFalse: [r value];
@@ -298,7 +298,7 @@ sealed typed Value subclass: MintHTTP1
     ]
 
   /// Parse `HTTP/1.1 200 OK` into `{{#http1, major, minor}, status}`.
-  class sealed parseStatusLine: line :: Binary -> Result(Tuple, Object) =>
+  class parseStatusLine: line :: Binary -> Result(Tuple, Object) =>
     text := self stringOrOpaque: line
     (text isKindOf: String) ifFalse: [^Result error: "status line is not UTF-8"]
     parts := text split: " "
@@ -310,7 +310,7 @@ sealed typed Value subclass: MintHTTP1
     Result ok: {version value, code value}
 
   /// Parse `HTTP/1.1` into `{#http1, major, minor}`.
-  class sealed parseVersion: token :: String -> Result(Tuple, Object) =>
+  class parseVersion: token :: String -> Result(Tuple, Object) =>
     (token startsWith: "HTTP/") ifFalse: [^Result error: "unsupported version"]
     halves := token split: "/"
     halves size =:= 2 ifFalse: [^Result error: "malformed version"]
@@ -330,7 +330,7 @@ sealed typed Value subclass: MintHTTP1
   /// Parse header lines into `{name, value}` pairs: names lowercase,
   /// values Strings, or opaque Binaries when not valid UTF-8. Empty
   /// lines are skipped; a line without a colon is malformed.
-  class sealed parseHeaders: lines :: List(Binary) -> Result(List(MintHeader), Object) =>
+  class parseHeaders: lines :: List(Binary) -> Result(List(MintHeader), Object) =>
     out :: List(MintHeader) := #()
     lines
       do: [:line |
@@ -344,7 +344,7 @@ sealed typed Value subclass: MintHTTP1
     Result ok: out
 
   /// Parse one `name: value` line.
-  class sealed parseHeader: line :: Binary -> Result(MintHeader, Object) =>
+  class parseHeader: line :: Binary -> Result(MintHeader, Object) =>
     at := line indexOf: (Binary fromIolist: ":")
     at isNil ifTrue: [^Result error: "malformed header line"]
     nameText := self stringOrOpaque: (line part: 0 size: at - 1)
@@ -362,13 +362,13 @@ sealed typed Value subclass: MintHTTP1
 
   /// Strip ASCII spaces and tabs from both ends, byte-wise (for opaque
   /// non-UTF-8 header values, where `trim` cannot run).
-  class sealed stripOws: bytes :: Binary -> Binary =>
+  class stripOws: bytes :: Binary -> Binary =>
     start := self owsStart: bytes at: 0
     stop := self owsEnd: bytes at: (bytes bitSize div: 8)
     bytes part: start size: stop - start
 
   /// The first index that is not a space or tab.
-  class sealed owsStart: bytes :: Binary at: i :: Integer -> Integer =>
+  class owsStart: bytes :: Binary at: i :: Integer -> Integer =>
     i >= (bytes bitSize div: 8) ifTrue: [^i]
     byte := bytes byteAt: i
     ((byte =:= 32) or: [
@@ -376,7 +376,7 @@ sealed typed Value subclass: MintHTTP1
     ]) ifTrue: [self owsStart: bytes at: i + 1] ifFalse: [i]
 
   /// One past the last index that is not a space or tab.
-  class sealed owsEnd: bytes :: Binary at: n :: Integer -> Integer =>
+  class owsEnd: bytes :: Binary at: n :: Integer -> Integer =>
     n =:= 0 ifTrue: [^0]
     byte := bytes byteAt: n - 1
     ((byte =:= 32) or: [
@@ -384,7 +384,7 @@ sealed typed Value subclass: MintHTTP1
     ]) ifTrue: [self owsEnd: bytes at: n - 1] ifFalse: [n]
 
   /// Parse a chunk-size line (`1a; ext=1`) into its Integer size.
-  class sealed parseChunkSize: line :: Binary -> Result(Integer, Object) =>
+  class parseChunkSize: line :: Binary -> Result(Integer, Object) =>
     text := self stringOrOpaque: line
     (text isKindOf: String) ifFalse: [^Result error: "chunk size is not UTF-8"]
     bare := (text split: ";") at: 1
@@ -394,7 +394,7 @@ sealed typed Value subclass: MintHTTP1
     self parseHex: trimmed
 
   /// Parse a non-empty decimal digit string. Anything else is an error.
-  class sealed parseDecimal: text :: TextOrBytes -> Result(Integer, Object) =>
+  class parseDecimal: text :: TextOrBytes -> Result(Integer, Object) =>
     (text bitSize div: 8) =:= 0 ifTrue: [^Result error: "empty integer"]
     value := 0
     1
@@ -410,7 +410,7 @@ sealed typed Value subclass: MintHTTP1
     Result ok: value
 
   /// Parse a non-empty hexadecimal digit string. Anything else errors.
-  class sealed parseHex: text :: TextOrBytes -> Result(Integer, Object) =>
+  class parseHex: text :: TextOrBytes -> Result(Integer, Object) =>
     (text bitSize div: 8) =:= 0 ifTrue: [^Result error: "empty integer"]
     value := 0
     1
@@ -425,7 +425,7 @@ sealed typed Value subclass: MintHTTP1
     Result ok: value
 
   /// A hex digit's value, or nil.
-  class sealed hexValue: byte :: Integer -> Integer | Nil =>
+  class hexValue: byte :: Integer -> Integer | Nil =>
     (byte >= 48 and: [byte <= 57]) ifTrue: [^byte - 48]
     (byte >= 65 and: [byte <= 70]) ifTrue: [^byte - 55]
     (byte >= 97 and: [byte <= 102]) ifTrue: [^byte - 87]
@@ -435,7 +435,7 @@ sealed typed Value subclass: MintHTTP1
   /// `[::1]`): a bare `::1:port` in a `host` header or H2
   /// `:authority` is rejected by strict servers. A reg-name or IPv4
   /// literal passes through; detection is the presence of `:`.
-  class sealed bracketHost: host :: String -> String =>
+  class bracketHost: host :: String -> String =>
     (host includesSubstring: ":") ifTrue: ["[" ++ host ++ "]"] ifFalse: [host]
 
   /// Whether the connection can take another request.
