@@ -26,7 +26,7 @@
 /// - `{#unknown, type, flags, sid, payload}`
 ///
 /// `parse:buffer maxFrame:max` answers `{#ok, frame, rest}` (rest is the
-/// bytes past the frame), `{#more}` (need more bytes), or
+/// bytes past the frame), the bare Symbol `#more` (need more bytes), or
 /// `{#error, message}` (the connection is unusable — send `GOAWAY` and
 /// drop it, as `MintHTTP2` does).
 sealed typed Object subclass: MintH2Frame
@@ -66,7 +66,7 @@ sealed typed Object subclass: MintH2Frame
   // ===== Parsing =====
 
   /// Parse one frame from the head of `buffer`: `{#ok, frame, rest}`,
-  /// `{#more}`, or `{#error, message}`. `max` caps the accepted payload
+  /// `#more`, or `{#error, message}`. `max` caps the accepted payload
   /// size (the client's advertised `max_frame_size`).
   class parse: buffer :: Binary maxFrame: max :: Integer -> Tuple | Symbol =>
     (buffer size < 9) ifTrue: [^#more]

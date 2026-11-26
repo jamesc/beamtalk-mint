@@ -586,8 +586,8 @@ sealed typed Value subclass: MintHTTP2
     (self goawayRefuses: ref) ifTrue: [^Result error: #closed]
     taken := self takeFrame: ms
     taken isError ifTrue: [^taken]
-    conn :: MintHTTP2 := taken value at: 1
-    handled := conn handle: (taken value at: 2) for: ref
+    {conn, frame} := taken value
+    handled := conn handle: frame for: ref
     handled match: [
       {#continue, next} -> next pump: ref ms: ms;
       {#done, next, parts} -> Result ok: {next, parts};
