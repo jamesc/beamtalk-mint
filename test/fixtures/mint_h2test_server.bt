@@ -550,6 +550,15 @@ Actor subclass: MintH2TestServer
         sent isError ifTrue: [^sent]
         ^self sendRaw: (MintH2Frame dataEnd: sid)
       ]
+    tag =:= #oversize
+      ifTrue: [
+        ^self
+          sendRaw: (MintH2Frame
+            header: 16777215
+            type: 0
+            flags: 0
+            streamId: sid)
+      ]
     tag =:= #push
       ifTrue: [
         ^self

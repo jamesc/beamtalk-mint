@@ -272,6 +272,7 @@ sealed typed Value subclass: MintHTTP2
     parsed match: [
       #more -> self needMoreFor: ms;
       {#error, reason} -> self die: reason code: MintH2Frame protocolError;
+      {#frameSizeError, reason} -> self die: reason code: MintH2Frame frameSizeError;
       {#ok, frame, rest} -> Result ok: {(self withBuffer: rest), frame}
     ]
 

@@ -152,8 +152,8 @@ TestCase subclass: MintH2FrameTest
       endStream: true
       fragment: (Binary fromBytes: #(1, 2, 3))
       maxFrame: 16384
-    {tag, _frame} := MintH2Frame parse: big maxFrame: 2
-    self assert: tag equals: #error
+    {tag, _message} := MintH2Frame parse: big maxFrame: 2
+    self assert: tag equals: #frameSizeError
 
   // ===== Wire layout and malformed / truncated input =====
 
@@ -222,9 +222,38 @@ TestCase subclass: MintH2FrameTest
       streamId: 0) concat: (Binary fromBytes: #(1, 2, 3))
     self assert: (self parse: wire) equals: #more
 
-  testPartialOversizeFrameIsMoreNotError =>
-    wire := (MintH2Frame
+  /// Resource exhaustion guard (RFC 9113 §4.2): the announced length is
+  /// checked as soon as the 9-byte header is in, with none of the payload.
+  testOversizeHeaderAloneIsFrameSizeError =>
+    wire := MintH2Frame
       header: 20000
+      type: 0
+      flags: 0
+      streamId: 1
+    {tag, _message} := self parse: wire
+    self assert: tag equals: #frameSizeError
+
+  testOversizeHeaderWithPartialPayloadIsFrameSizeError =>
+    wire := (MintH2Frame
+      header: 16777215
+      type: 0
+      flags: 0
+      streamId: 1) concat: (Binary fromBytes: #(1, 2, 3))
+    {tag, _message} := self parse: wire
+    self assert: tag equals: #frameSizeError
+
+  testHeaderOneOverMaxIsFrameSizeError =>
+    wire := MintH2Frame
+      header: 16385
+      type: 1
+      flags: 0
+      streamId: 1
+    {tag, _message} := self parse: wire
+    self assert: tag equals: #frameSizeError
+
+  testHeaderAtMaxWaitsForPayload =>
+    wire := (MintH2Frame
+      header: 16384
       type: 0
       flags: 0
       streamId: 1) concat: (Binary fromBytes: #(1, 2, 3))
@@ -236,8 +265,8 @@ TestCase subclass: MintH2FrameTest
       flags: 0
       sid: 1
       payload: (Binary fromBytes: #(1, 2, 3))
-    {tag, _frame} := MintH2Frame parse: wire maxFrame: 2
-    self assert: tag equals: #error
+    {tag, _message} := MintH2Frame parse: wire maxFrame: 2
+    self assert: tag equals: #frameSizeError
 
   testFrameExactlyAtMaxIsAccepted =>
     wire := self

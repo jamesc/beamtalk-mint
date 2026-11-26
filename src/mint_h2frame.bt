@@ -27,8 +27,17 @@
 ///
 /// `parse:buffer maxFrame:max` answers `{#ok, frame, rest}` (rest is the
 /// bytes past the frame), the bare Symbol `#more` (need more bytes), or
-/// `{#error, message}` (the connection is unusable — send `GOAWAY` and
-/// drop it, as `MintHTTP2` does).
+/// `{#error, message}` (the connection is unusable — send `GOAWAY` with
+/// `PROTOCOL_ERROR` and drop it, as `MintHTTP2` does), or
+/// `{#frameSizeError, message}` (the header announced a payload above
+/// `max`: a connection error answered with `FRAME_SIZE_ERROR`).
+///
+/// The announced length is checked against `max` as soon as the 9-byte
+/// header is in, before any payload is waited for or buffered, so a peer
+/// cannot make the client hold up to 16 MB for a frame it will reject.
+/// RFC 9113 §4.2 allows a stream error for an oversize frame that cannot
+/// alter connection state (e.g. DATA); that would mean discarding the
+/// payload, so every oversize frame is a connection error here.
 sealed typed Object subclass: MintH2Frame
 
   // ===== Constants =====
@@ -66,42 +75,41 @@ sealed typed Object subclass: MintH2Frame
   // ===== Parsing =====
 
   /// Parse one frame from the head of `buffer`: `{#ok, frame, rest}`,
-  /// `#more`, or `{#error, message}`. `max` caps the accepted payload
-  /// size (the client's advertised `max_frame_size`).
+  /// `#more`, `{#error, message}` or `{#frameSizeError, message}`. `max`
+  /// caps the accepted payload size (the client's advertised
+  /// `max_frame_size`).
   class parse: buffer :: Binary maxFrame: max :: Integer -> Tuple | Symbol =>
     (buffer size < 9) ifTrue: [^#more]
     buffer match: [
-      <<length:24, type:8, flags:8, _reserved:1, sid:31, rest/binary>> -> self
-        parseBody: rest
-        length: length
-        type: type
-        flags: flags
-        sid: sid
-        maxFrame: max;
+      <<length:24, type:8, flags:8, _reserved:1, sid:31, rest/binary>> -> length > max
+        ifTrue: [{#frameSizeError, "frame payload exceeds max_frame_size"}]
+        ifFalse: [
+          self
+            parseBody: rest
+            length: length
+            type: type
+            flags: flags
+            sid: sid
+        ];
       _ -> {#error, "malformed frame header"}
     ]
 
-  /// Split the payload off `rest` (its size is the header's `length`)
-  /// and dispatch on the frame type. A short buffer is `#more`, checked
-  /// before the size cap so a peer cannot get an error out of a partial
-  /// frame.
-  class parseBody: rest :: Binary length: length :: Integer type: type :: Integer flags: flags :: Integer sid: sid :: Integer maxFrame: max :: Integer -> Tuple | Symbol =>
+  /// Split the payload off `rest` (its size is the header's `length`,
+  /// already checked against the cap) and dispatch on the frame type. A
+  /// short buffer is `#more`.
+  class parseBody: rest :: Binary length: length :: Integer type: type :: Integer flags: flags :: Integer sid: sid :: Integer -> Tuple | Symbol =>
     rest match: [
       <<payload:length/binary, tail/binary>> -> self
         framed: type
         flags: flags
         sid: sid
         payload: payload
-        tail: tail
-        maxFrame: max;
+        tail: tail;
       _ -> #more
     ]
 
   /// Dispatch one whole frame and pair its result with the bytes after it.
-  class framed: type :: Integer flags: flags :: Integer sid: sid :: Integer payload: payload :: Binary tail: tail :: Binary maxFrame: max :: Integer -> Tuple =>
-    payload size > max ifTrue: [
-      ^{#error, "frame payload exceeds max_frame_size"}
-    ]
+  class framed: type :: Integer flags: flags :: Integer sid: sid :: Integer payload: payload :: Binary tail: tail :: Binary -> Tuple =>
     framed := self
       dispatch: type
       flags: flags
