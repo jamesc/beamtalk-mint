@@ -25,12 +25,14 @@
 /// - `{#rstStream, sid, errorCode}`
 /// - `{#unknown, type, flags, sid, payload}`
 ///
-/// `parse:buffer maxFrame:max` answers `{#ok, frame, rest}` (rest is the
-/// bytes past the frame), the bare Symbol `#more` (need more bytes), or
-/// `{#error, message}` (the connection is unusable — send `GOAWAY` with
-/// `PROTOCOL_ERROR` and drop it, as `MintHTTP2` does), or
-/// `{#frameSizeError, message}` (the header announced a payload above
-/// `max`: a connection error answered with `FRAME_SIZE_ERROR`).
+/// `parse:buffer maxFrame:max` answers one of:
+///
+/// - `{#ok, frame, rest}` — `rest` is the bytes past the frame
+/// - `#more` — need more bytes
+/// - `{#error, message}` — the connection is unusable; `MintHTTP2` sends
+///   `GOAWAY` with `PROTOCOL_ERROR` and drops it
+/// - `{#frameSizeError, message}` — the header announced a payload above
+///   `max`; `MintHTTP2` sends `GOAWAY` with `FRAME_SIZE_ERROR`
 ///
 /// The announced length is checked against `max` as soon as the 9-byte
 /// header is in, before any payload is waited for or buffered, so a peer
