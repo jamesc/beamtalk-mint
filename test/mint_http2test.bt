@@ -414,6 +414,39 @@ TestCase subclass: MintHTTP2Test
     self assert: result error equals: {#reset, 0}
     live close
 
+  testWrongSizePriorityOnResetStreamIsNotAnsweredTwice =>
+    conn := self connect
+    {live, ref} := (conn
+      request: "GET"
+      target: "/one"
+      headers: #()
+      body: "") unwrap
+    {live2, other} := (live
+      request: "GET"
+      target: "/two"
+      headers: #()
+      body: "") unwrap
+    // Two wrong-size PRIORITYs on `other`, then a peer reset ends the
+    // wait on `ref`. Only the first PRIORITY earns a RST_STREAM.
+    bad := self
+      wireFrame: 2
+      sid: other
+      size: 4
+    wire := (bad concat: bad) concat: (MintH2Frame rstStream: ref code: 0)
+    (self.srv serveNext: {#raw, wire}) unwrap
+    result := live2 stream: ref timeout: 5000
+    self assert: result error equals: {#reset, 0}
+    // The server saw the second request's HEADERS, then exactly one reset.
+    seen := (self.srv pollFrame) unwrap
+    self assert: (seen at: 1) equals: #headers
+    first := (self.srv pollFrame) unwrap
+    self assert: (first at: 1) equals: #rstStream
+    self assert: (first at: 2) equals: other
+    self assert: (first at: 3) equals: 6
+    third := Result tryDo: [self.srv pollFrame]
+    self assert: third isError
+    live2 close
+
   testPushPromiseDies =>
     conn := self connect
     {live, ref} := (conn
