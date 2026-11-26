@@ -212,8 +212,7 @@ sealed typed Value subclass: MintHTTP2
   awaitSettings: ms :: Integer -> Result(MintHTTP2, Object) =>
     taken := self takeFrame: ms
     taken isError ifTrue: [^taken]
-    conn := taken value at: 1
-    frame := taken value at: 2
+    {conn, frame} := taken value
     frame =:= #settingsAck ifTrue: [^conn awaitSettingsAcked: ms]
     conn applyServerSettings: frame
 
@@ -222,8 +221,7 @@ sealed typed Value subclass: MintHTTP2
   awaitSettingsAcked: ms :: Integer -> Result(MintHTTP2, Object) =>
     taken := self takeFrame: ms
     taken isError ifTrue: [^taken]
-    conn := taken value at: 1
-    frame := taken value at: 2
+    {conn, frame} := taken value
     frame =:= #settingsAck ifTrue: [
       ^conn die: "expected SETTINGS as first frame" code: MintH2Frame protocolError
     ]
@@ -271,18 +269,17 @@ sealed typed Value subclass: MintHTTP2
   /// full frame. Answers `Result ok:` with `{conn, frame}`.
   takeFrame: ms :: Integer -> Result(Tuple, Object) =>
     parsed := MintH2Frame parse: self buffer maxFrame: MintH2Frame defaultMaxFrame
-    parsed =:= #more
-      ifTrue: [
-        chunk := self recv: ms
-        chunk isError ifTrue: [^chunk]
-        ^(self withBuffer: (self buffer concat: chunk value)) takeFrame: ms
-      ]
-    (parsed at: 1) =:= #error
-      ifTrue: [
-        reason :: String := parsed at: 2
-        ^self die: reason code: MintH2Frame protocolError
-      ]
-    Result ok: {(self withBuffer: (parsed at: 3)), (parsed at: 2)}
+    parsed match: [
+      #more -> self needMoreFor: ms;
+      {#error, reason} -> self die: reason code: MintH2Frame protocolError;
+      {#ok, frame, rest} -> Result ok: {(self withBuffer: rest), frame}
+    ]
+
+  /// Pump one `recv` into the buffer and try `takeFrame:` again.
+  needMoreFor: ms :: Integer -> Result(Tuple, Object) =>
+    chunk := self recv: ms
+    chunk isError ifTrue: [^chunk]
+    (self withBuffer: (self buffer concat: chunk value)) takeFrame: ms
 
   /// Answer a connection error: `GOAWAY` goes out best effort, the
   /// socket closes, and the message comes back as `Result error:`.
@@ -364,8 +361,7 @@ sealed typed Value subclass: MintHTTP2
       target: target
       headers: headers
     built isError ifTrue: [^built]
-    conn := built value at: 1
-    fragment := built value at: 2
+    {conn, fragment} := built value
     bodyBin := Binary fromIolist: body
     wire := MintH2Frame
       headers: sid
@@ -592,10 +588,11 @@ sealed typed Value subclass: MintHTTP2
     taken isError ifTrue: [^taken]
     conn :: MintHTTP2 := taken value at: 1
     handled := conn handle: (taken value at: 2) for: ref
-    tag := handled at: 1
-    tag =:= #continue ifTrue: [^(handled at: 2) pump: ref ms: ms]
-    tag =:= #done ifTrue: [^Result ok: {(handled at: 2), (handled at: 3)}]
-    Result error: (handled at: 2)
+    handled match: [
+      {#continue, next} -> next pump: ref ms: ms;
+      {#done, next, parts} -> Result ok: {next, parts};
+      {#error, reason} -> Result error: reason
+    ]
 
   /// Handle one frame for the stream `ref` is waiting on:
   /// `{#continue, conn}`, `{#done, conn, parts}`, or
@@ -850,8 +847,7 @@ sealed typed Value subclass: MintHTTP2
         died := conn die: reason code: MintH2Frame protocolError
         ^{#error, died error}
       ]
-    status :: Integer := split at: 2
-    headList :: List(MintHeader) := split at: 3
+    {_, status, headList} := split
     (status >= 100 and: [status < 200])
       ifTrue: [
         status =:= 101

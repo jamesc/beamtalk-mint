@@ -154,3 +154,413 @@ TestCase subclass: MintH2FrameTest
       maxFrame: 16384
     {tag, _frame} := MintH2Frame parse: big maxFrame: 2
     self assert: tag equals: #error
+
+  // ===== Wire layout and malformed / truncated input =====
+
+  /// A raw frame: `header` for `payload`'s size, then the payload.
+  frame: type flags: flags sid: sid payload: payload =>
+    (MintH2Frame
+      header: payload size
+      type: type
+      flags: flags
+      streamId: sid) concat: payload
+
+  /// The error message of a parse that must fail.
+  errorOf: wire =>
+    result := self parse: wire
+    self assert: (result at: 1) equals: #error
+    result at: 2
+
+  testHeaderWireLayout =>
+    wire := MintH2Frame
+      header: 66051
+      type: 1
+      flags: 4
+      streamId: 2147483647
+    self assert: wire equals: (Binary fromBytes: #(1, 2, 3, 1, 4, 127, 255, 255, 255))
+
+  testHeaderMasksReservedBitOfStreamId =>
+    wire := MintH2Frame
+      header: 0
+      type: 0
+      flags: 0
+      streamId: 4294967297
+    self assert: wire equals: (Binary fromBytes: #(0, 0, 0, 0, 0, 0, 0, 0, 1))
+
+  testIntegerHelpersWireLayout =>
+    self assert: (MintH2Frame bytes16: 258) equals: (Binary fromBytes: #(1, 2))
+    self assert: (MintH2Frame bytes32: 16909060) equals: (Binary fromBytes: #(1, 2, 3, 4))
+    self assert: (MintH2Frame bytes31: 4294967295) equals: (Binary fromBytes: #(127, 255, 255, 255))
+
+  testReservedBitOfStreamIdIsIgnoredOnParse =>
+    wire := Binary fromBytes: #(0, 0, 4, 8, 0, 128, 0, 0, 5, 0, 0, 1, 0)
+    {tag, frame, _rest} := self parse: wire
+    self assert: tag equals: #ok
+    self assert: frame equals: {#windowUpdate, 5, 256}
+
+  testReservedBitOfWindowIncrementIsIgnored =>
+    wire := self
+      frame: 8
+      flags: 0
+      sid: 0
+      payload: (Binary fromBytes: #(128, 0, 0, 7))
+    {tag, frame, _rest} := self parse: wire
+    self assert: tag equals: #ok
+    self assert: frame equals: {#windowUpdate, 0, 7}
+
+  testEveryHeaderPrefixIsMore =>
+    wire := MintH2Frame windowUpdate: 1 increment: 9
+    0 to: wire size - 1 do: [:n |
+      self assert: (self parse: (wire part: 0 size: n)) equals: #more
+    ]
+
+  testTruncatedPayloadIsMoreAndKeepsNothing =>
+    wire := (MintH2Frame
+      header: 8
+      type: 6
+      flags: 0
+      streamId: 0) concat: (Binary fromBytes: #(1, 2, 3))
+    self assert: (self parse: wire) equals: #more
+
+  testPartialOversizeFrameIsMoreNotError =>
+    wire := (MintH2Frame
+      header: 20000
+      type: 0
+      flags: 0
+      streamId: 1) concat: (Binary fromBytes: #(1, 2, 3))
+    self assert: (self parse: wire) equals: #more
+
+  testCompleteOversizeFrameIsError =>
+    wire := self
+      frame: 0
+      flags: 0
+      sid: 1
+      payload: (Binary fromBytes: #(1, 2, 3))
+    {tag, _frame} := MintH2Frame parse: wire maxFrame: 2
+    self assert: tag equals: #error
+
+  testFrameExactlyAtMaxIsAccepted =>
+    wire := self
+      frame: 0
+      flags: 0
+      sid: 1
+      payload: (Binary fromBytes: #(1, 2))
+    {tag, frame, _rest} := MintH2Frame parse: wire maxFrame: 2
+    self assert: tag equals: #ok
+    self assert: frame equals: {#data, 1, false, (Binary fromBytes: #(1, 2))}
+
+  testUnknownFrameTypeIsPreserved =>
+    payload := Binary fromBytes: #(1, 2)
+    {tag, frame, rest} := self
+      parse: ((self
+        frame: 200
+        flags: 3
+        sid: 9
+        payload: payload) concat: (Binary fromBytes: #(7)))
+    self assert: tag equals: #ok
+    self assert: frame equals: {#unknown, 200, 3, 9, payload}
+    self assert: rest equals: (Binary fromBytes: #(7))
+
+  testPaddedDataStripsPadding =>
+    wire := self
+      frame: 0
+      flags: 8
+      sid: 1
+      payload: (Binary fromBytes: #(2, 10, 11, 0, 0))
+    {tag, frame, _rest} := self parse: wire
+    self assert: tag equals: #ok
+    self assert: frame equals: {#data, 1, false, (Binary fromBytes: #(10, 11))}
+
+  testPaddedDataWithNoPaddingAndEmptyBody =>
+    wire := self
+      frame: 0
+      flags: 9
+      sid: 1
+      payload: (Binary fromBytes: #(0))
+    {tag, frame, _rest} := self parse: wire
+    self assert: tag equals: #ok
+    self assert: frame equals: {#data, 1, true, (Binary fromBytes: #())}
+
+  testPaddedDataWithAllPaddingIsEmptyBody =>
+    wire := self
+      frame: 0
+      flags: 8
+      sid: 1
+      payload: (Binary fromBytes: #(2, 0, 0))
+    {tag, frame, _rest} := self parse: wire
+    self assert: tag equals: #ok
+    self assert: frame equals: {#data, 1, false, (Binary fromBytes: #())}
+
+  testPaddedDataPadLengthPastPayloadIsError =>
+    wire := self
+      frame: 0
+      flags: 8
+      sid: 1
+      payload: (Binary fromBytes: #(4, 10, 0, 0))
+    self assert: (self errorOf: wire) equals: "DATA frame with invalid padding length"
+
+  testPaddedDataMaxPadLengthIsError =>
+    wire := self
+      frame: 0
+      flags: 8
+      sid: 1
+      payload: (Binary fromBytes: #(255, 1))
+    self assert: (self errorOf: wire) equals: "DATA frame with invalid padding length"
+
+  testPaddedDataEmptyPayloadIsError =>
+    wire := self
+      frame: 0
+      flags: 8
+      sid: 1
+      payload: (Binary fromBytes: #())
+    self assert: (self errorOf: wire) equals: "DATA frame with insufficient padding data"
+
+  testPaddedHeadersStripsPadding =>
+    wire := self
+      frame: 1
+      flags: 12
+      sid: 1
+      payload: (Binary fromBytes: #(1, 7, 8, 0))
+    {tag, frame, _rest} := self parse: wire
+    self assert: tag equals: #ok
+    self assert: frame equals: {#headers, 1, false, true, (Binary fromBytes: #(7, 8))}
+
+  testPaddedHeadersWithPriorityStripsBoth =>
+    wire := self
+      frame: 1
+      flags: 44
+      sid: 1
+      payload: (Binary fromBytes: #(1, 128, 0, 0, 3, 15, 7, 8, 0))
+    {tag, frame, _rest} := self parse: wire
+    self assert: tag equals: #ok
+    self assert: frame equals: {#headers, 1, false, true, (Binary fromBytes: #(7, 8))}
+
+  testPaddedHeadersPadLengthPastPayloadIsError =>
+    wire := self
+      frame: 1
+      flags: 12
+      sid: 1
+      payload: (Binary fromBytes: #(5, 7, 8))
+    self assert: (self errorOf: wire) equals: "HEADERS frame with invalid padding length"
+
+  testPaddedHeadersEmptyPayloadIsError =>
+    wire := self
+      frame: 1
+      flags: 12
+      sid: 1
+      payload: (Binary fromBytes: #())
+    self assert: (self errorOf: wire) equals: "HEADERS frame with insufficient data for its flags"
+
+  testHeadersWithPriorityStripsFiveBytes =>
+    wire := self
+      frame: 1
+      flags: 36
+      sid: 1
+      payload: (Binary fromBytes: #(128, 0, 0, 3, 15, 7, 8))
+    {tag, frame, _rest} := self parse: wire
+    self assert: tag equals: #ok
+    self assert: frame equals: {#headers, 1, false, true, (Binary fromBytes: #(7, 8))}
+
+  testHeadersWithTruncatedPriorityIsError =>
+    wire := self
+      frame: 1
+      flags: 36
+      sid: 1
+      payload: (Binary fromBytes: #(0, 0, 0, 3))
+    self assert: (self errorOf: wire) equals: "HEADERS frame with insufficient data for its flags"
+
+  testHeadersOnStreamZeroIsError =>
+    wire := self
+      frame: 1
+      flags: 4
+      sid: 0
+      payload: (Binary fromBytes: #(1))
+    self assert: (self errorOf: wire) equals: "HEADERS frame with zero stream_id"
+
+  testContinuationOnStreamZeroIsError =>
+    wire := self
+      frame: 9
+      flags: 4
+      sid: 0
+      payload: (Binary fromBytes: #(1))
+    self assert: (self errorOf: wire) equals: "CONTINUATION frame with zero stream_id"
+
+  testPriorityWrongSizesAreErrors =>
+    #(0, 4, 6)
+      do: [:n |
+        wire := self
+          frame: 2
+          flags: 0
+          sid: 1
+          payload: ((Binary fromBytes: #(0, 0, 0, 0, 0, 0)) part: 0 size: n)
+        self assert: (self errorOf: wire) equals: "Invalid payload size in PRIORITY frame"
+      ]
+
+  testPriorityIsParsedAsUnknown =>
+    payload := Binary fromBytes: #(0, 0, 0, 3, 15)
+    {tag, frame, _rest} := self
+      parse: (self
+        frame: 2
+        flags: 0
+        sid: 1
+        payload: payload)
+    self assert: tag equals: #ok
+    self assert: frame equals: {#unknown, 2, 0, 1, payload}
+
+  testRstStreamWrongSizesAreErrors =>
+    #(0, 3, 5)
+      do: [:n |
+        wire := self
+          frame: 3
+          flags: 0
+          sid: 1
+          payload: ((Binary fromBytes: #(0, 0, 0, 0, 0)) part: 0 size: n)
+        self assert: (self errorOf: wire) equals: "Invalid payload size in RST_STREAM frame"
+      ]
+
+  testRstStreamOnStreamZeroIsError =>
+    wire := self
+      frame: 3
+      flags: 0
+      sid: 0
+      payload: (Binary fromBytes: #(0, 0, 0, 8))
+    self assert: (self errorOf: wire) equals: "RST_STREAM frame with zero stream_id"
+
+  testSettingsTruncatedEntryIsError =>
+    #(1, 5, 7, 11)
+      do: [:n |
+        wire := self
+          frame: 4
+          flags: 0
+          sid: 0
+          payload: ((Binary fromBytes: #(0, 3, 0, 0, 0, 100, 0, 3, 0, 0, 0, 1)) part: 0 size: n)
+        self assert: (self errorOf: wire) equals: "Invalid SETTINGS size"
+      ]
+
+  testSettingsOnNonZeroStreamIsError =>
+    wire := self
+      frame: 4
+      flags: 0
+      sid: 1
+      payload: (Binary fromBytes: #())
+    self assert: (self errorOf: wire) equals: "Invalid SETTINGS frame"
+
+  testSettingsAckWithPayloadIsError =>
+    wire := self
+      frame: 4
+      flags: 1
+      sid: 0
+      payload: (Binary fromBytes: #(0, 3, 0, 0, 0, 1))
+    self assert: (self errorOf: wire) equals: "SETTINGS ack frame with non-empty payload"
+
+  testSettingsUnknownIdIsIgnored =>
+    wire := self
+      frame: 4
+      flags: 0
+      sid: 0
+      payload: (Binary fromBytes: #(0, 99, 0, 0, 0, 1, 0, 3, 0, 0, 0, 100))
+    {tag, frame, _rest} := self parse: wire
+    self assert: tag equals: #ok
+    self assert: frame equals: {#settings, #{#max_concurrent_streams => 100}}
+
+  testSettingsInvalidValuesAreErrors =>
+    // enable_push 2, initial_window_size 2^31, max_frame_size 16383 and 2^24
+    self
+      assert: (self
+        errorOf: (self
+          frame: 4
+          flags: 0
+          sid: 0
+          payload: (Binary fromBytes: #(0, 2, 0, 0, 0, 2))))
+      equals: "Invalid enable_push value"
+    self
+      assert: (self
+        errorOf: (self
+          frame: 4
+          flags: 0
+          sid: 0
+          payload: (Binary fromBytes: #(0, 4, 128, 0, 0, 0))))
+      equals: "Invalid window_size"
+    self
+      assert: (self
+        errorOf: (self
+          frame: 4
+          flags: 0
+          sid: 0
+          payload: (Binary fromBytes: #(0, 5, 0, 0, 63, 255))))
+      equals: "Invalid max_frame_size"
+    self
+      assert: (self
+        errorOf: (self
+          frame: 4
+          flags: 0
+          sid: 0
+          payload: (Binary fromBytes: #(0, 5, 1, 0, 0, 0))))
+      equals: "Invalid max_frame_size"
+
+  testPingWrongSizesAreErrors =>
+    #(0, 7, 9)
+      do: [:n |
+        wire := self
+          frame: 6
+          flags: 0
+          sid: 0
+          payload: ((Binary fromBytes: #(1, 2, 3, 4, 5, 6, 7, 8, 9)) part: 0 size: n)
+        self assert: (self errorOf: wire) equals: "PING frame with invalid payload size"
+      ]
+
+  testPingOnNonZeroStreamIsError =>
+    wire := self
+      frame: 6
+      flags: 0
+      sid: 1
+      payload: (Binary fromBytes: #(1, 2, 3, 4, 5, 6, 7, 8))
+    self assert: (self errorOf: wire) equals: "Invalid stream ID in PING frame"
+
+  testGoawayShortPayloadsAreErrors =>
+    #(0, 3, 7)
+      do: [:n |
+        wire := self
+          frame: 7
+          flags: 0
+          sid: 0
+          payload: ((Binary fromBytes: #(0, 0, 0, 5, 0, 0, 0, 2)) part: 0 size: n)
+        self assert: (self errorOf: wire) equals: "Invalid payload size in GOAWAY frame"
+      ]
+
+  testGoawayDropsDebugData =>
+    wire := self
+      frame: 7
+      flags: 0
+      sid: 0
+      payload: (Binary fromBytes: #(128, 0, 0, 5, 0, 0, 0, 2, 100, 98, 103))
+    {tag, frame, _rest} := self parse: wire
+    self assert: tag equals: #ok
+    self assert: frame equals: {#goaway, 5, 2}
+
+  testGoawayOnNonZeroStreamIsError =>
+    wire := self
+      frame: 7
+      flags: 0
+      sid: 1
+      payload: (Binary fromBytes: #(0, 0, 0, 5, 0, 0, 0, 2))
+    self assert: (self errorOf: wire) equals: "Invalid stream ID in GOAWAY frame"
+
+  testWindowUpdateWrongSizesAreErrors =>
+    #(0, 3, 5)
+      do: [:n |
+        wire := self
+          frame: 8
+          flags: 0
+          sid: 1
+          payload: ((Binary fromBytes: #(0, 0, 0, 1, 1)) part: 0 size: n)
+        self assert: (self errorOf: wire) equals: "Invalid WINDOW_UPDATE frame"
+      ]
+
+  testWindowUpdateZeroIncrementWithReservedBitIsError =>
+    wire := self
+      frame: 8
+      flags: 0
+      sid: 1
+      payload: (Binary fromBytes: #(128, 0, 0, 0))
+    self assert: (self errorOf: wire) equals: "Invalid WINDOW_UPDATE size increment"
