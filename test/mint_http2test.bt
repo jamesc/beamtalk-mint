@@ -294,6 +294,24 @@ TestCase subclass: MintHTTP2Test
     self assert: (update at: 3) equals: 3
     live close
 
+  testOversizeFrameHeaderDiesWithFrameSizeError =>
+    conn := self connect
+    {live, ref} := (conn
+      request: "GET"
+      target: "/oversize"
+      headers: #()
+      body: "") unwrap
+    // The server sends only the 9-byte header of a 16 MB frame and stalls:
+    // the client must not wait for the payload.
+    (self.srv serveNext: {#oversize}) unwrap
+    result := live stream: ref timeout: 5000
+    self deny: result isOk
+    self assert: result error equals: "frame payload exceeds max_frame_size"
+    update := (self.srv pollFrame) unwrap
+    self assert: (update at: 1) equals: #goaway
+    self assert: (update at: 3) equals: 6
+    live close
+
   testPushPromiseDies =>
     conn := self connect
     {live, ref} := (conn
