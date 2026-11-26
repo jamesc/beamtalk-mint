@@ -32,7 +32,12 @@
 /// - `{#error, message}` — the connection is unusable; `MintHTTP2` sends
 ///   `GOAWAY` with `PROTOCOL_ERROR` and drops it
 /// - `{#frameSizeError, message}` — the header announced a payload above
-///   `max`; `MintHTTP2` sends `GOAWAY` with `FRAME_SIZE_ERROR`
+///   `max`, or a fixed-size frame (`PING`, `WINDOW_UPDATE`, `RST_STREAM`)
+///   or `SETTINGS` has the wrong length; `MintHTTP2` sends `GOAWAY` with
+///   `FRAME_SIZE_ERROR`
+/// - `{#streamError, sid, message, rest}` — a wrong-size `PRIORITY`
+///   (RFC 9113 §6.3): a stream error, so `MintHTTP2` resets `sid` with
+///   `FRAME_SIZE_ERROR` and keeps reading from `rest`
 ///
 /// The announced length is checked against `max` as soon as the 9-byte
 /// header is in, before any payload is waited for or buffered, so a peer
@@ -117,11 +122,20 @@ sealed typed Object subclass: MintH2Frame
       flags: flags
       sid: sid
       payload: payload
-    (framed at: 1) =:= #error ifTrue: [^framed]
+    (framed at: 1) =:= #ok
+      ifFalse: [
+        // A stream error leaves the connection usable, so it carries the
+        // bytes past the frame for the caller to keep reading.
+        (framed at: 1) =:= #streamError ifTrue: [
+          ^{#streamError, framed at: 2, framed at: 3, tail}
+        ]
+        ^framed
+      ]
     {#ok, framed at: 2, tail}
 
   /// Dispatch a fully-buffered payload on its type, answering
-  /// `{#ok, frame}` or `{#error, message}`.
+  /// `{#ok, frame}`, `{#error, message}`, `{#frameSizeError, message}`
+  /// or `{#streamError, sid, message}`.
   class dispatch: type :: Integer flags: flags :: Integer sid: sid :: Integer payload: payload :: Binary -> Tuple =>
     type match: [
       0 -> self
@@ -248,7 +262,7 @@ sealed typed Object subclass: MintH2Frame
     sid =:= 0 ifTrue: [^{#error, "PRIORITY frame with zero stream_id"}]
     payload match: [
       <<_reserved:1, _dep:31, _weight:8>> -> {#ok, {#unknown, 2, flags, sid, payload}};
-      _ -> {#error, "Invalid payload size in PRIORITY frame"}
+      _ -> {#streamError, sid, "Invalid payload size in PRIORITY frame"}
     ]
 
   /// A RST_STREAM frame: stream 0 and short payloads are errors.
@@ -256,7 +270,7 @@ sealed typed Object subclass: MintH2Frame
     sid =:= 0 ifTrue: [^{#error, "RST_STREAM frame with zero stream_id"}]
     payload match: [
       <<code:32>> -> {#ok, {#rstStream, sid, code}};
-      _ -> {#error, "Invalid payload size in RST_STREAM frame"}
+      _ -> {#frameSizeError, "Invalid payload size in RST_STREAM frame"}
     ]
 
   /// A SETTINGS frame: stream 0 only; an ACK must be empty; parameters
@@ -268,7 +282,9 @@ sealed typed Object subclass: MintH2Frame
       ifTrue: [
         payload size =:= 0 ifTrue: [
           ^{#ok, #settingsAck}
-        ] ifFalse: [^{#error, "SETTINGS ack frame with non-empty payload"}]
+        ] ifFalse: [
+          ^{#frameSizeError, "SETTINGS ack frame with non-empty payload"}
+        ]
       ]
       ifFalse: [self settingsParams: payload acc: #{}]
 
@@ -281,7 +297,7 @@ sealed typed Object subclass: MintH2Frame
         value: value
         rest: rest
         acc: acc;
-      _ -> {#error, "Invalid SETTINGS size"}
+      _ -> {#frameSizeError, "Invalid SETTINGS size"}
     ]
 
   /// Fold one setting entry into `acc` (unknown ids ignored).
@@ -315,7 +331,7 @@ sealed typed Object subclass: MintH2Frame
     sid =:= 0 ifFalse: [^{#error, "Invalid stream ID in PING frame"}]
     payload size =:= 8 ifTrue: [
       ^{#ok, {#ping, (self flagSet: flags bit: 0), payload}}
-    ] ifFalse: [^{#error, "PING frame with invalid payload size"}]
+    ] ifFalse: [^{#frameSizeError, "PING frame with invalid payload size"}]
 
   /// A GOAWAY frame: stream 0 only.
   class goaway: _flags :: Integer sid: sid :: Integer payload: payload :: Binary -> Tuple =>
@@ -330,7 +346,7 @@ sealed typed Object subclass: MintH2Frame
     payload match: [
       <<_reserved:1, 0:31>> -> {#error, "Invalid WINDOW_UPDATE size increment"};
       <<_r:1, inc:31>> -> {#ok, {#windowUpdate, sid, inc}};
-      _ -> {#error, "Invalid WINDOW_UPDATE frame"}
+      _ -> {#frameSizeError, "Invalid WINDOW_UPDATE frame"}
     ]
 
   /// A CONTINUATION frame: stream 0 is a connection error.

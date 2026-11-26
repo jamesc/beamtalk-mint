@@ -312,6 +312,90 @@ TestCase subclass: MintHTTP2Test
     self assert: (update at: 3) equals: 6
     live close
 
+  /// A frame with a wrong-size payload, as raw wire bytes.
+  wireFrame: type :: Integer sid: sid :: Integer size: n :: Integer -> Binary =>
+    payload := (Binary fromBytes: #(0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0)) part: 0 size: n
+    (MintH2Frame
+      header: n
+      type: type
+      flags: 0
+      streamId: sid) concat: payload
+
+  /// Send `wire` as the response to a request and answer the failed
+  /// stream result and the next frame the server sees.
+  badSizeConnectionError: wire :: Binary =>
+    conn := self connect
+    {live, ref} := (conn
+      request: "GET"
+      target: "/badsize"
+      headers: #()
+      body: "") unwrap
+    (self.srv serveNext: {#raw, wire}) unwrap
+    result := live stream: ref timeout: 5000
+    self deny: result isOk
+    update := (self.srv pollFrame) unwrap
+    self assert: (update at: 1) equals: #goaway
+    self assert: (update at: 3) equals: 6
+    live close
+
+  testWrongSizePingDiesWithFrameSizeError =>
+    self
+      badSizeConnectionError: (self
+        wireFrame: 6
+        sid: 0
+        size: 7)
+
+  testWrongSizeWindowUpdateDiesWithFrameSizeError =>
+    self
+      badSizeConnectionError: (self
+        wireFrame: 8
+        sid: 1
+        size: 3)
+
+  testWrongSizeRstStreamDiesWithFrameSizeError =>
+    self
+      badSizeConnectionError: (self
+        wireFrame: 3
+        sid: 1
+        size: 5)
+
+  testMisalignedSettingsDiesWithFrameSizeError =>
+    self
+      badSizeConnectionError: (self
+        wireFrame: 4
+        sid: 0
+        size: 7)
+
+  testSettingsAckWithPayloadDiesWithFrameSizeError =>
+    self
+      badSizeConnectionError: ((MintH2Frame
+        header: 6
+        type: 4
+        flags: 1
+        streamId: 0) concat: (Binary fromBytes: #(0, 3, 0, 0, 0, 100)))
+
+  testWrongSizePriorityResetsStreamOnly =>
+    conn := self connect
+    {live, ref} := (conn
+      request: "GET"
+      target: "/badprio"
+      headers: #()
+      body: "") unwrap
+    (self.srv
+      serveNext: {#raw, (self
+        wireFrame: 2
+        sid: ref
+        size: 4)}) unwrap
+    result := live stream: ref timeout: 5000
+    self deny: result isOk
+    self assert: result error equals: {#reset, 6}
+    update := (self.srv pollFrame) unwrap
+    self assert: (update at: 1) equals: #rstStream
+    self assert: (update at: 2) equals: ref
+    self assert: (update at: 3) equals: 6
+    self assert: live isOpen
+    live close
+
   testPushPromiseDies =>
     conn := self connect
     {live, ref} := (conn

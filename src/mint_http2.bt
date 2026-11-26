@@ -273,8 +273,17 @@ sealed typed Value subclass: MintHTTP2
       #more -> self needMoreFor: ms;
       {#error, reason} -> self die: reason code: MintH2Frame protocolError;
       {#frameSizeError, reason} -> self die: reason code: MintH2Frame frameSizeError;
+      {#streamError, sid, _reason, rest} -> (self withBuffer: rest) resetFor: sid;
       {#ok, frame, rest} -> Result ok: {(self withBuffer: rest), frame}
     ]
+
+  /// Answer a stream error on `sid` (RFC 9113 §5.4.2): send `RST_STREAM`
+  /// with `FRAME_SIZE_ERROR` and hand the stream's owner the same reset a
+  /// peer `RST_STREAM` would be, so the connection stays usable.
+  resetFor: sid :: Integer -> Result(Tuple, Object) =>
+    sent := self sendBytes: (MintH2Frame rstStream: sid code: MintH2Frame frameSizeError)
+    sent isError ifTrue: [^sent]
+    Result ok: {sent value, {#rstStream, sid, MintH2Frame frameSizeError}}
 
   /// Pump one `recv` into the buffer and try `takeFrame:` again.
   needMoreFor: ms :: Integer -> Result(Tuple, Object) =>

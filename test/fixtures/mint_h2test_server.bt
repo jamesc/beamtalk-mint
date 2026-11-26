@@ -524,7 +524,8 @@ Actor subclass: MintH2TestServer
   /// body}` (headers are `"name: value"` lines), `#echo` (the request
   /// body, status 200), `{#rst, code}` (a `RST_STREAM` instead of a
   /// response), `{#dataFirst, body}` (`DATA` before any `HEADERS` —
-  /// a protocol violation, for client-error tests), `{#push}` (a
+  /// a protocol violation, for client-error tests), `{#raw, bytes}` (those
+  /// bytes verbatim), `{#push}` (a
   /// `PUSH_PROMISE`, also a violation), or `{#respInterim, interim,
   /// status, headers, body}` (a `1xx` block before the final one).
   respond: spec stream: sid :: Integer headers: _headers body: body -> Result(Nil, Object) =>
@@ -560,6 +561,7 @@ Actor subclass: MintH2TestServer
             flags: 0
             streamId: sid)
       ]
+    tag =:= #raw ifTrue: [^self sendRaw: (spec at: 2)]
     tag =:= #push
       ifTrue: [
         ^self

@@ -171,6 +171,13 @@ TestCase subclass: MintH2FrameTest
     self assert: (result at: 1) equals: #error
     result at: 2
 
+  /// The `{#frameSizeError, message}` of a parse that must fail with
+  /// FRAME_SIZE_ERROR (a connection error).
+  sizeErrorOf: wire =>
+    result := self parse: wire
+    self assert: (result at: 1) equals: #frameSizeError
+    result at: 2
+
   testHeaderWireLayout =>
     wire := MintH2Frame
       header: 66051
@@ -422,8 +429,28 @@ TestCase subclass: MintH2FrameTest
           flags: 0
           sid: 1
           payload: ((Binary fromBytes: #(0, 0, 0, 0, 0, 0)) part: 0 size: n)
-        self assert: (self errorOf: wire) equals: "Invalid payload size in PRIORITY frame"
+        result := self parse: wire
+        self assert: result equals: {#streamError, 1, "Invalid payload size in PRIORITY frame", (Binary fromBytes: #())}
       ]
+
+  testPriorityWrongSizeOnStreamZeroIsProtocolError =>
+    wire := self
+      frame: 2
+      flags: 0
+      sid: 0
+      payload: (Binary fromBytes: #(0, 0, 0, 0))
+    self assert: (self errorOf: wire) equals: "PRIORITY frame with zero stream_id"
+
+  testPriorityWrongSizeKeepsFollowingFrame =>
+    wire := (self
+      frame: 2
+      flags: 0
+      sid: 1
+      payload: (Binary fromBytes: #(0, 0, 0, 0))) concat: MintH2Frame settingsAck
+    {tag, sid, _message, rest} := self parse: wire
+    self assert: tag equals: #streamError
+    self assert: sid equals: 1
+    self assert: rest equals: MintH2Frame settingsAck
 
   testPriorityIsParsedAsUnknown =>
     payload := Binary fromBytes: #(0, 0, 0, 3, 15)
@@ -444,7 +471,7 @@ TestCase subclass: MintH2FrameTest
           flags: 0
           sid: 1
           payload: ((Binary fromBytes: #(0, 0, 0, 0, 0)) part: 0 size: n)
-        self assert: (self errorOf: wire) equals: "Invalid payload size in RST_STREAM frame"
+        self assert: (self sizeErrorOf: wire) equals: "Invalid payload size in RST_STREAM frame"
       ]
 
   testRstStreamOnStreamZeroIsError =>
@@ -463,8 +490,16 @@ TestCase subclass: MintH2FrameTest
           flags: 0
           sid: 0
           payload: ((Binary fromBytes: #(0, 3, 0, 0, 0, 100, 0, 3, 0, 0, 0, 1)) part: 0 size: n)
-        self assert: (self errorOf: wire) equals: "Invalid SETTINGS size"
+        self assert: (self sizeErrorOf: wire) equals: "Invalid SETTINGS size"
       ]
+
+  testSettingsAckWithPayloadIsFrameSizeError =>
+    wire := self
+      frame: 4
+      flags: 1
+      sid: 0
+      payload: (Binary fromBytes: #(0, 3, 0, 0, 0, 100))
+    self assert: (self sizeErrorOf: wire) equals: "SETTINGS ack frame with non-empty payload"
 
   testSettingsOnNonZeroStreamIsError =>
     wire := self
@@ -480,7 +515,7 @@ TestCase subclass: MintH2FrameTest
       flags: 1
       sid: 0
       payload: (Binary fromBytes: #(0, 3, 0, 0, 0, 1))
-    self assert: (self errorOf: wire) equals: "SETTINGS ack frame with non-empty payload"
+    self assert: (self sizeErrorOf: wire) equals: "SETTINGS ack frame with non-empty payload"
 
   testSettingsUnknownIdIsIgnored =>
     wire := self
@@ -535,7 +570,7 @@ TestCase subclass: MintH2FrameTest
           flags: 0
           sid: 0
           payload: ((Binary fromBytes: #(1, 2, 3, 4, 5, 6, 7, 8, 9)) part: 0 size: n)
-        self assert: (self errorOf: wire) equals: "PING frame with invalid payload size"
+        self assert: (self sizeErrorOf: wire) equals: "PING frame with invalid payload size"
       ]
 
   testPingOnNonZeroStreamIsError =>
@@ -583,7 +618,7 @@ TestCase subclass: MintH2FrameTest
           flags: 0
           sid: 1
           payload: ((Binary fromBytes: #(0, 0, 0, 1, 1)) part: 0 size: n)
-        self assert: (self errorOf: wire) equals: "Invalid WINDOW_UPDATE frame"
+        self assert: (self sizeErrorOf: wire) equals: "Invalid WINDOW_UPDATE frame"
       ]
 
   testWindowUpdateZeroIncrementWithReservedBitIsError =>
