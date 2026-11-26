@@ -26,7 +26,7 @@
 /// - `{#unknown, type, flags, sid, payload}`
 ///
 /// `parse:buffer maxFrame:max` answers `{#ok, frame, rest}` (rest is the
-/// bytes past the frame), `{#more}` (need more bytes), or
+/// bytes past the frame), the bare Symbol `#more` (need more bytes), or
 /// `{#error, message}` (the connection is unusable — send `GOAWAY` and
 /// drop it, as `MintHTTP2` does).
 sealed typed Object subclass: MintH2Frame
@@ -66,9 +66,9 @@ sealed typed Object subclass: MintH2Frame
   // ===== Parsing =====
 
   /// Parse one frame from the head of `buffer`: `{#ok, frame, rest}`,
-  /// `{#more}`, or `{#error, message}`. `max` caps the accepted payload
+  /// `#more`, or `{#error, message}`. `max` caps the accepted payload
   /// size (the client's advertised `max_frame_size`).
-  class parse: buffer :: Binary maxFrame: max :: Integer -> Tuple =>
+  class parse: buffer :: Binary maxFrame: max :: Integer -> Tuple | Symbol =>
     (buffer size < 9) ifTrue: [^#more]
     buffer match: [
       <<length:24, type:8, flags:8, _reserved:1, sid:31, rest/binary>> -> self
@@ -81,12 +81,27 @@ sealed typed Object subclass: MintH2Frame
       _ -> {#error, "malformed frame header"}
     ]
 
-  /// Split the payload off `rest` and dispatch on the frame type.
-  class parseBody: rest :: Binary length: length :: Integer type: type :: Integer flags: flags :: Integer sid: sid :: Integer maxFrame: max :: Integer -> Tuple =>
-    (rest size < length) ifTrue: [^#more]
-    length > max ifTrue: [^{#error, "frame payload exceeds max_frame_size"}]
-    payload := rest part: 0 size: length
-    tail := rest part: length size: (rest size - length)
+  /// Split the payload off `rest` (its size is the header's `length`)
+  /// and dispatch on the frame type. A short buffer is `#more`, checked
+  /// before the size cap so a peer cannot get an error out of a partial
+  /// frame.
+  class parseBody: rest :: Binary length: length :: Integer type: type :: Integer flags: flags :: Integer sid: sid :: Integer maxFrame: max :: Integer -> Tuple | Symbol =>
+    rest match: [
+      <<payload:length/binary, tail/binary>> -> self
+        framed: type
+        flags: flags
+        sid: sid
+        payload: payload
+        tail: tail
+        maxFrame: max;
+      _ -> #more
+    ]
+
+  /// Dispatch one whole frame and pair its result with the bytes after it.
+  class framed: type :: Integer flags: flags :: Integer sid: sid :: Integer payload: payload :: Binary tail: tail :: Binary maxFrame: max :: Integer -> Tuple =>
+    payload size > max ifTrue: [
+      ^{#error, "frame payload exceeds max_frame_size"}
+    ]
     framed := self
       dispatch: type
       flags: flags
@@ -156,13 +171,11 @@ sealed typed Object subclass: MintH2Frame
     payload size =:= 0 ifTrue: [
       ^{#error, "DATA frame with insufficient padding data"}
     ]
+    // The data length is whatever the pad length leaves over.
+    room := payload size - 1
     payload match: [
-      <<padLength:8, body/binary>> -> body size >= padLength
-        ifTrue: [
-          {#ok, {#data, sid, (self flagSet: flags bit: 0), (body part: 0 size: (body size - padLength))}}
-        ]
-        ifFalse: [{#error, "DATA frame with invalid padding length"}];
-      _ -> {#error, "DATA frame with insufficient padding data"}
+      <<padLength:8, body:(room - padLength)/binary, _padding:padLength/binary>> -> {#ok, {#data, sid, (self flagSet: flags bit: 0), body}};
+      _ -> {#error, "DATA frame with invalid padding length"}
     ]
 
   /// A HEADERS frame: stream 0 is a connection error; priority data is
@@ -198,22 +211,18 @@ sealed typed Object subclass: MintH2Frame
     payload size =:= 0 ifTrue: [
       ^{#error, "HEADERS frame with insufficient data for its flags"}
     ]
+    room := payload size - 1
     payload match: [
-      <<padLength:8, body/binary>> -> body size >= padLength
+      <<padLength:8, inner:(room - padLength)/binary, _padding:padLength/binary>> -> hasPriority
         ifTrue: [
-          inner := body part: 0 size: (body size - padLength)
-          hasPriority
-            ifTrue: [
-              ^self
-                priorityHeaders: endStream
-                endHeaders: endHeaders
-                payload: inner
-                sid: sid
-            ]
-            ifFalse: [^{#ok, {#headers, sid, endStream, endHeaders, inner}}]
+          self
+            priorityHeaders: endStream
+            endHeaders: endHeaders
+            payload: inner
+            sid: sid
         ]
-        ifFalse: [{#error, "HEADERS frame with invalid padding length"}];
-      _ -> {#error, "HEADERS frame with insufficient data for its flags"}
+        ifFalse: [{#ok, {#headers, sid, endStream, endHeaders, inner}}];
+      _ -> {#error, "HEADERS frame with invalid padding length"}
     ]
 
   /// Skip the 5 priority bytes of a HEADERS payload.
@@ -321,20 +330,19 @@ sealed typed Object subclass: MintH2Frame
 
   // ===== Serializing =====
 
-  /// The 9-byte frame header.
+  /// The 9-byte frame header: 24-bit length, type, flags, a clear
+  /// reserved bit and the 31-bit stream id.
   class header: length :: Integer type: type :: Integer flags: flags :: Integer streamId: sid :: Integer -> Binary =>
-    Binary fromBytes: #((length bitShift: -16) bitAnd: 255, (length bitShift: -8) bitAnd: 255, length bitAnd: 255, type, flags, (sid bitShift: -24) bitAnd: 127, (sid bitShift: -16) bitAnd: 255, (sid bitShift: -8) bitAnd: 255, sid bitAnd: 255)
+    <<length:24, type:8, flags:8, 0:1, sid:31>>
 
   /// A 16-bit big-endian integer.
-  class bytes16: n :: Integer -> Binary =>
-    Binary fromBytes: #((n bitShift: -8) bitAnd: 255, n bitAnd: 255)
+  class bytes16: n :: Integer -> Binary => <<n:16>>
 
   /// A 32-bit big-endian integer.
-  class bytes32: n :: Integer -> Binary =>
-    Binary fromBytes: #((n bitShift: -24) bitAnd: 255, (n bitShift: -16) bitAnd: 255, (n bitShift: -8) bitAnd: 255, n bitAnd: 255)
+  class bytes32: n :: Integer -> Binary => <<n:32>>
 
   /// A 31-bit big-endian integer (the top bit cleared).
-  class bytes31: n :: Integer -> Binary => self bytes32: (n bitAnd: 2147483647)
+  class bytes31: n :: Integer -> Binary => <<0:1, n:31>>
 
   /// The next chunk size for a `size`-byte payload capped at `max`.
   class chunkOf: size :: Integer max: max :: Integer -> Integer =>
