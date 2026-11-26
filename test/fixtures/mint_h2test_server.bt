@@ -264,6 +264,7 @@ Actor subclass: MintH2TestServer
       ]
     (parsed at: 1) =:= #error ifTrue: [^Result error: (parsed at: 2)]
     (parsed at: 1) =:= #frameSizeError ifTrue: [^Result error: (parsed at: 2)]
+    (parsed at: 1) =:= #streamError ifTrue: [^Result error: (parsed at: 3)]
     self.rest := parsed at: 3
     frame := parsed at: 2
     self noteFrame: frame

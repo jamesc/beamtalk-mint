@@ -396,6 +396,24 @@ TestCase subclass: MintHTTP2Test
     self assert: live isOpen
     live close
 
+  testWrongSizePriorityOnUnknownStreamIsDropped =>
+    conn := self connect
+    {live, ref} := (conn
+      request: "GET"
+      target: "/idleprio"
+      headers: #()
+      body: "") unwrap
+    // PRIORITY on an idle stream is legal: no RST_STREAM goes out, and
+    // the peer's own reset (code 0) that follows is what the stream sees.
+    bad := (self
+      wireFrame: 2
+      sid: 99
+      size: 4) concat: (MintH2Frame rstStream: ref code: 0)
+    (self.srv serveNext: {#raw, bad}) unwrap
+    result := live stream: ref timeout: 5000
+    self assert: result error equals: {#reset, 0}
+    live close
+
   testPushPromiseDies =>
     conn := self connect
     {live, ref} := (conn
